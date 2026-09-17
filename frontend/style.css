@@ -1,0 +1,1426 @@
+/* ─────────────────────────────────────────────
+   Excel → SQL 查询台
+   方向：黑白灰极简
+   纯白底 · 近黑文字 · 灰发丝线 · 主按钮黑底白字
+   ───────────────────────────────────────────── */
+
+:root {
+  --bg: #ffffff;
+  --card: #ffffff;
+  --bg-soft: #fafafa;
+  --bg-tint: #f5f5f5;
+  --border: #e8e8ea;
+  --border-strong: #d6d6da;
+  --text: #16181d;
+  --muted: #6b717a;
+  --muted-2: #9aa0ab;
+  --accent: #16181d;
+  --accent-hover: #000000;
+  --danger: #d33a3a;
+  --ok: #1f9d55;
+  --mono: "JetBrains Mono", "IBM Plex Mono", "Cascadia Code", Consolas, "Microsoft YaHei",
+    "PingFang SC", monospace;
+  --sans: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", "Helvetica Neue", sans-serif;
+  --gutter-x: 30px;               /* 顶栏与内容区统一的左右水平内边距，保证视觉对齐 */
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.55;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 背景氛围元素在极简风格下不显示 */
+.vg-grid,
+.vg-glow { display: none; }
+
+/* ── 顶栏 ── */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px var(--gutter-x);
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+}
+
+.brand { display: flex; align-items: center; gap: 11px; }
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  color: #fff;
+  background: var(--accent);
+  border-radius: 6px;
+}
+.brand-mark svg { width: 16px; height: 16px; }
+
+.brand-title {
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text);
+  line-height: 1.2;
+}
+.brand-arrow { color: var(--muted-2); font-weight: 400; }
+.brand-sub {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--muted-2);
+  margin-left: 1px;
+}
+
+.topbar-right { display: flex; align-items: center; gap: 14px; }
+.mode-switch {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.mode-btn {
+  border: none;
+  background: var(--card);
+  color: var(--muted);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.mode-btn + .mode-btn { border-left: 1px solid var(--border); }
+.mode-btn.active {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.live {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  background: var(--card);
+  padding: 4px 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border-radius: 999px;
+}
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+
+/* ── 布局 ── */
+.layout {
+  flex: 1;
+  display: flex;
+  gap: 0;                           /* 间距由分栏器自带的 gap 承担，避免双重间隔 */
+  padding: 18px var(--gutter-x);    /* 与顶栏左右边距统一，视觉对齐 */
+  overflow: hidden;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: 210px;
+  min-width: 180px;
+  flex: 0 0 auto;                   /* 左栏不伸长，宽度由拖拽分栏器控制 */
+}
+.panel.grow { flex: 1; width: auto; min-width: 320px; min-height: 0; }
+
+/* 左栏：数据源卡片自适应内容，字段卡片占满剩余并内部控制滚动。
+   多源时源列表会变长，pick-card 需允许收缩且源列表内部滚动，否则字段卡片被挤压不可见。 */
+#leftPanel { overflow: hidden; }
+#leftPanel .pick-card {
+  flex: 0 1 auto;                   /* 允许收缩，避免把下方字段卡片挤没 */
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+#fieldsCard {
+  flex: 1;
+  min-height: 180px;                /* 保证字段区始终可见，不被源列表挤压消失 */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;                 /* 卡片本身不滚，滚动发生在 #fieldsBox */
+}
+#fieldsCard .step-head { flex: 0 0 auto; }
+#fieldsCard .field-search { flex: 0 0 auto; }
+
+/* 分栏拖拽器 */
+.splitter {
+  flex: 0 0 10px;
+  cursor: col-resize;
+  align-self: stretch;
+  background: transparent;
+  touch-action: none;
+  position: relative;
+}
+.splitter::after {                 /* 中间细线（hover/拖拽时加深） */
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 4px;
+  width: 2px;
+  background: transparent;
+  transition: background .15s;
+}
+.splitter:hover::after,
+.splitter.dragging::after { background: var(--border-strong); }
+.splitter.dragging { cursor: col-resize; }
+
+/* ── 卡片 ── */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px;
+  overflow: hidden;                 /* 卡片本身不滚动，滚动交给内部内容区统一处理 */
+}
+.panel.grow .card { display: flex; flex-direction: column; }
+.panel.grow .card:last-child {
+  flex: 1;
+  min-height: 0;
+  /* 右侧卡片自身作为唯一的纵向滚动容器：SQL 编辑器与结果全部在里面随内容
+     展开，超出即整体竖向滚动，可上滑回看 SQL。 */
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* ── 模块头部 ── */
+.step-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.step-title { min-width: 0; }
+h2 {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.01em;
+}
+h2 .muted { font-weight: 400; }
+
+.muted { color: var(--muted); font-weight: 400; }
+code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  color: var(--text);
+  background: var(--bg-tint);
+  border: 1px solid var(--border);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+/* ── 紧凑选择文件卡片 ── */
+.pick-card { display: flex; flex-direction: column; gap: 10px; padding: 14px; }
+.pick-line { display: flex; align-items: center; gap: 10px; }
+.pick-line .btn { flex: 1; justify-content: center; }
+.pick-card .file-info { margin-top: 0; }
+.pick-card .status-msg { margin-top: 0; }
+
+/* ── 多源数据源列表 ── */
+.source-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;               /* 略收紧卡片间距 */
+  max-height: 300px;      /* 卡片变矮后上限微调，仍内部滚动防挤压 */
+  overflow-y: auto;
+  padding-right: 4px;     /* 给滚动条留呼吸 */
+}
+
+/* 数据源状态卡：序号 + 别名 + 文件 + 字段数 + 选择/删除 */
+.source-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 10px;      /* 略收紧内边距 */
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  cursor: pointer;
+  background: var(--card);
+  transition: border-color .14s, background .14s;
+}
+.source-item:hover { background: var(--bg-soft); }
+.source-item.active {
+  border-color: var(--text);
+  background: var(--bg-soft);
+  box-shadow: inset 3px 0 0 var(--accent);   /* 左侧选中指示条，强化当前源 */
+}
+
+/* 卡头：序号徽标 + 别名 + 删除 */
+.source-item-head { display: flex; align-items: center; gap: 8px; }
+.src-index {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--bg-tint);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+}
+.source-item.active .src-index { background: var(--accent); color: #fff; }
+
+.alias-input {
+  width: 84px;              /* 别名框加宽：容纳稍长的语义化别名（sales_2024 等） */
+  min-width: 0;
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  text-align: center;
+}
+.alias-input:focus { outline: none; border-color: var(--text); }
+
+/* 选择/更换 + 删除：同款图标按钮（方形、无边框、hover 加深） */
+.src-pick,
+.src-del {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted-2);
+  border-radius: 5px;
+  cursor: pointer;
+  transition: color .14s, background .14s, border-color .14s;
+}
+.src-pick:hover,
+.src-del:hover {
+  color: var(--text);
+  background: var(--bg-tint);
+  border-color: var(--border);
+}
+/* 删除：hover 变红，提示危险操作 */
+.src-del:hover { color: var(--danger); }
+.src-pick svg,
+.src-del svg { display: block; }
+
+/* 文件行：文件名单行省略 + 字段数徽标 + 紧凑选择/更换按钮 */
+.src-path-row {
+  display: flex;
+  align-items: center;    /* center：与右侧紧凑按钮垂直对齐 */
+  gap: 8px;
+}
+.src-path {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--muted);
+  white-space: nowrap;          /* 单行展示，不换行 */
+  overflow: hidden;
+  text-overflow: ellipsis;      /* 过长省略号，完整文件名见悬停 title */
+}
+.src-colcount {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted-2);
+  background: var(--bg-tint);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+/* 内联的「选择/更换」按钮：位于卡头行（序号/别名同排），尽量紧凑防溢出 */
+.src-pick {
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+#addSourceBtn { font-size: 12.5px; padding: 7px; }
+
+/* 工作表行（仅多 sheet 时显示） */
+.src-sheet-row { display: flex; }
+.source-item .src-sheet {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 7px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  background: var(--card);
+  cursor: pointer;
+}
+.source-item .src-sheet:focus { outline: none; border-color: var(--text); }
+
+/* ── 文件浏览器 ── */
+.browser { display: flex; flex-direction: column; gap: 9px; }
+.browser-toolbar { display: flex; gap: 7px; align-items: center; }
+.browser-toolbar .path-input { flex: 1; min-width: 0; }
+
+.icon-btn {
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 9px 12px;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1;
+}
+.icon-btn:hover { border-color: var(--border-strong); background: var(--bg-soft); }
+
+.path-input {
+  border: 1px solid var(--border);
+  background: var(--card);
+  border-radius: 6px;
+  padding: 9px 11px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+}
+.path-input:focus {
+  outline: none;
+  border-color: var(--text);
+  box-shadow: 0 0 0 3px rgba(22, 24, 29, 0.08);
+}
+.path-input::placeholder { color: var(--muted-2); }
+
+.browser-list {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  max-height: 230px;
+  overflow: auto;
+}
+.browser-list:empty { display: none; }
+.browser-list .placeholder { padding: 12px; color: var(--muted-2); }
+.browser-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+}
+.browser-item:last-child { border-bottom: none; }
+.browser-item:hover { background: var(--bg-soft); }
+.bi-icon {
+  width: 18px;
+  text-align: center;
+  color: var(--muted-2);
+  font-family: var(--sans);
+}
+.bi-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.path-note { margin-top: 10px; font-size: 12px; line-height: 1.6; color: var(--muted); }
+
+.file-info {
+  margin-top: 12px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--ok);
+  border-radius: 6px;
+  background: var(--bg-soft);
+}
+.file-icon { color: var(--ok); display: grid; place-items: center; }
+.file-icon svg { width: 16px; height: 16px; }
+.file-name {
+  flex: 1;
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.remove-btn {
+  flex: 0 0 auto;
+  font-size: 12px;
+  padding: 4px 10px;
+  color: var(--danger);
+  border-color: var(--border);
+}
+
+.status-msg { margin-top: 10px; font-size: 12.5px; min-height: 18px; color: var(--muted); }
+.status-msg.error { color: var(--danger); }
+.status-msg.ok { color: var(--ok); }
+
+/* 状态消息内嵌在 .actions 里时不占独立行 */
+.actions .status-msg { margin-top: 0; flex: 1; min-width: 120px; }
+
+/* ── 字段列表 ── */
+.field-search {
+  width: 100%;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  margin-bottom: 10px;
+}
+.field-search:focus {
+  outline: none;
+  border-color: var(--text);
+  box-shadow: 0 0 0 3px rgba(22, 24, 29, 0.08);
+}
+.field-search::placeholder { color: var(--muted-2); }
+/* 字段区：唯一滚动容器，占满字段卡片剩余高度 */
+#fieldsBox {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  align-content: flex-start;
+  padding-right: 4px;              /* 给滚动条留出呼吸，避免 chips 贴边 */
+}
+.field-chip {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 9px;
+  cursor: pointer;
+  transition: border-color .14s, background .14s;
+}
+.field-chip:hover { border-color: var(--text); background: var(--bg-soft); }
+.field-chip .ftype { color: var(--muted-2); margin-left: 7px; font-size: 11px; }
+.field-chip:hover .ftype { color: var(--muted); }
+.placeholder { color: var(--muted-2); font-size: 13px; margin: 4px 0; }
+
+/* ── SQL ── */
+.sql-bar { display: flex; flex-direction: column; gap: 9px; }
+#sqlInput {
+  width: 100%;
+  border: 1px solid var(--border);
+  background: var(--card);
+  border-radius: 6px;
+  padding: 13px 14px;
+  font-family: var(--mono);
+  font-size: 13.5px;
+  line-height: 1.65;
+  resize: vertical;
+  color: var(--text);
+  caret-color: var(--text);
+}
+#sqlInput:focus {
+  outline: none;
+  border-color: var(--text);
+  box-shadow: 0 0 0 3px rgba(22, 24, 29, 0.08);
+}
+#sqlInput::placeholder { color: var(--muted-2); }
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+
+.btn {
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 9px 16px;
+  cursor: pointer;
+  border-radius: 6px;
+  letter-spacing: 0.01em;
+  transition: border-color .14s, background .14s, color .14s;
+}
+.btn:hover { border-color: var(--text); }
+
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.btn.primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: #ffffff;
+}
+.btn.primary svg { width: 15px; height: 13px; }
+
+.btn.ghost { background: transparent; }
+
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn:disabled:hover { border-color: var(--border); background: var(--card); color: var(--text); }
+
+.ctrl {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.ctrl select {
+  min-width: 148px;
+  max-width: 240px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.ctrl select:focus { outline: none; border-color: var(--text); }
+
+/* ── 结果 ── */
+.result-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.row-count { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.result-actions { display: flex; gap: 8px; }
+.result-actions .btn { padding: 6px 12px; font-size: 12px; }
+
+.result-wrap {
+  flex: 1;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  min-height: 180px;
+  background: var(--card);
+}
+
+/* 全屏：结果卡片脱离布局，铺满视口 */
+.result-card-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: var(--bg);
+  border-radius: 0;
+  border: none;
+  padding: 22px 26px;
+}
+.result-card-fullscreen .result-wrap { min-height: 0; }
+/* 表格：border-collapse: separate 才能让 th 的 position: sticky 生效
+   （collapse 时 sticky 表头不冻结）。用 border-spacing:0 消除缝隙，
+   单元格只保留右边+下边边框，外框由 table 补上，避免双边框。 */
+table {
+  border-collapse: separate;
+  border-spacing: 0;
+  width: 100%;
+  font-size: 12px;
+  border-top: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+}
+th, td {
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 6px 12px;
+  text-align: left;
+  white-space: nowrap;
+}
+th {
+  background: var(--bg-soft);
+  position: sticky;
+  top: 0;
+  z-index: 1;                     /* 盖住下方滚动上来的数据行 */
+  box-shadow: inset 0 -1px 0 var(--border); /* 表头下缘发丝线，滚动中保持清晰 */
+  color: var(--muted);
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+}
+td { font-family: var(--mono); color: var(--text); }
+tbody tr:nth-child(even) { background: var(--bg-soft); }
+tbody tr:hover { background: var(--bg-tint); }
+#resultTable.hidden { display: none; }
+
+.hidden { display: none; }
+
+/* ── 入场：简洁错峰浮现 ── */
+.card.step { animation: rise .4s cubic-bezier(.22, .9, .3, 1) both; }
+.card.step:nth-of-type(2) { animation-delay: .05s; }
+.card.step:nth-of-type(3) { animation-delay: .1s; }
+@keyframes rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* ── 滚动条 ── */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border: 2px solid var(--card); border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted-2); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ── 侧栏切换按钮（顶栏）── */
+.sidebar-toggle {
+  display: none;                    /* 宽屏默认隐藏，窄屏抽屉模式才显示 */
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.sidebar-toggle svg { width: 16px; height: 14px; }
+.sidebar-toggle:hover { border-color: var(--text); background: var(--bg-soft); }
+
+/* ── 窄窗口：左栏抽屉化 ── */
+/* 桌面窗口最小 960×640，用 960 作为抽屉阈值更贴合实际；小于它时左栏收起为
+   悬浮抽屉，由顶栏侧栏按钮切换，避免把 Notebook 挤得不可用。 */
+@media (max-width: 960px) {
+  .sidebar-toggle { display: inline-flex; }
+  .splitter { display: none; }      /* 抽屉模式不需要拖拽分栏 */
+  .layout { position: relative; }
+
+  #leftPanel {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 60;
+    width: 260px;
+    transform: translateX(-100%);
+    transition: transform .22s cubic-bezier(.22,.9,.3,1);
+    background: var(--bg);
+    border-right: 1px solid var(--border);
+    box-shadow: 4px 0 24px rgba(22,24,29,0.08);
+    padding-right: 12px;
+    overflow-y: auto;
+  }
+  /* 抽屉打开：露出左栏；右栏保持原位 */
+  .layout.drawer-open #leftPanel { transform: translateX(0); }
+  .panel.grow { min-width: 0; }
+
+  /* 点击抽屉外的遮罩关闭 */
+  .layout.drawer-open::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 50;
+    background: rgba(22,24,29,0.18);
+  }
+}
+
+/* ── SQL Notebook（多查询 cell）── */
+/* Notebook 随内容自然展开，纵向滚动统一交给外层右侧卡片实现整体滑动。 */
+.notebook {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;   /* 分隔按钮自带间距，gap 收窄避免双重留白 */
+}
+
+/* cell 之间的分隔按钮：「+ 查询」下沉为插入点，左右两条发丝线 */
+.cell-divider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 18px;
+  flex: 0 0 auto;
+}
+.cell-divider-line {
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+.cell-divider-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--muted-2);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: color .14s, border-color .14s, background .14s, transform .14s;
+}
+.cell-divider-btn svg { display: block; }
+.cell-divider-btn:hover {
+  color: var(--text);
+  border-color: var(--text);
+  background: var(--bg-soft);
+  transform: scale(1.1);
+}
+
+/* 右侧浮动大纲：cell 数量 >1 时以竖向浮轨形式贴窗口右侧，随滚动常驻、不占内容流。
+   落点利用 .layout 右侧 30px 留白（--gutter-x），避开卡片内容与滚动条。 */
+.cell-outline {
+  position: fixed;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 5px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 4px 16px rgba(22, 24, 29, 0.10);
+  /* 默认隐藏：仅在滚动时由 JS 加 .visible 才淡入 */
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .18s ease;
+}
+.cell-outline.visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+.cell-outline.hidden { display: none; }
+.outline-chip {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: border-color .14s, background .14s, color .14s;
+}
+.outline-chip:hover { border-color: var(--text); color: var(--text); }
+.outline-chip.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.notebook-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+/* 参数组 ｜ 操作组：视觉分隔，避免「工作表」参数与「+ 查询」结构操作混排 */
+.nb-params,
+.nb-ops {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.nb-params + .nb-ops {
+  padding-left: 14px;
+  border-left: 1px solid var(--border);
+}
+
+.cell {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  transition: border-color .15s, box-shadow .15s;
+}
+
+/* 聚焦的 cell：边框 + 阴影强调，弱化非当前 cell 的视觉噪音 */
+.cell.focused {
+  border-color: var(--text);
+  box-shadow: 0 0 0 3px rgba(22, 24, 29, 0.06);
+}
+
+.cell-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;   /* 左右两组分居两端 */
+  gap: 10px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-soft);
+}
+.cell-head-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+}
+/* cell 序号徽标：与多源数据源卡序号风格一致 */
+.cell-index {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--bg-tint);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+}
+.cell.focused .cell-index { background: var(--accent); color: #fff; }
+.cell-head-right {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+}
+
+.cell-run {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 5px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background .14s, border-color .14s;
+}
+.cell-run:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.cell-run:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.cell-status {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cell-status.error { color: var(--danger); }
+.cell-status.ok { color: var(--ok); }
+
+/* per-cell 行数限制输入框（原全局「限制行数」下沉到每个查询单元） */
+.cell-limit {
+  width: 62px;
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  background: var(--card);
+}
+.cell-limit:focus { outline: none; border-color: var(--text); }
+
+/* cell 头部图标按钮（折叠 / 删除）统一风格：方形 + 图标 + hover 反馈 */
+.cell-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--muted-2);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color .14s, border-color .14s, background .14s;
+}
+.cell-icon svg { display: block; }
+.cell-icon:hover { color: var(--text); border-color: var(--text); background: var(--bg-soft); }
+
+/* 删除按钮 hover 转红 */
+.cell-del:hover { color: var(--danger); border-color: var(--danger); background: var(--card); }
+
+/* cell 折叠/展开 + 可折叠主体 */
+.cell-body { display: block; }
+.cell-body.collapsed { display: none; }
+
+/* SQL 编辑器：CodeMirror（光标/文字/行号/高亮统一同一布局引擎，彻底消除错位） */
+.cell-editor {
+  position: relative;
+  width: 100%;
+  background: var(--card);
+  font-family: var(--mono);
+  font-size: 13.5px;
+  line-height: 22px;
+}
+
+/* CodeMirror 根容器：高度由 JS 按内容自适应，随内容完整展开（不再内部截断滚动），
+   纵向滚动统一交给右侧 notebook，实现整体竖向滑动。 */
+.cell-editor .CodeMirror {
+  height: auto;
+  font-family: var(--mono);
+  font-size: 13.5px;
+  line-height: 22px;
+  color: var(--text);
+  background: var(--card);
+}
+
+/* 行号列：贴合现有黑白灰极简风（浅灰底 + 发丝分隔线） */
+.cell-editor .CodeMirror-gutters {
+  background: var(--bg-soft);
+  border-right: 1px solid var(--border);
+  padding-right: 4px;
+}
+.cell-editor .CodeMirror-linenumber {
+  color: var(--muted-2);
+  font-family: var(--mono);
+}
+
+/* 光标与选区（延续黑白主题，不用默认蓝紫） */
+.cell-editor .CodeMirror-cursor { border-left: 1px solid var(--text); }
+.cell-editor .CodeMirror-selected,
+.cell-editor .CodeMirror-focused .CodeMirror-selected {
+  background: rgba(22, 24, 29, 0.15);
+}
+
+/* SQL 高亮配色（参考 Notepad++ 默认白底主题）：
+   关键词/函数 = 蓝 + 加粗；字符串 = 灰；数字 = 红；注释 = 绿 + 斜体。
+   null/true/false 作为原子字面量用蓝色（不与关键词的加粗混淆，但仍属蓝色系）。 */
+.cm-s-excelsql .cm-keyword   { color: #0000ff; font-weight: 700; }
+.cm-s-excelsql .cm-string    { color: #808080; }
+.cm-s-excelsql .cm-string-2  { color: #808080; }
+.cm-s-excelsql .cm-number    { color: #ff0000; }
+.cm-s-excelsql .cm-comment   { color: #008000; font-style: italic; }
+.cm-s-excelsql .cm-atom      { color: #0000ff; }
+
+/* 全角标点高亮（overlay 层）：中文输入法下全角/半角括号逗号混淆。
+   差异化分三层，从强到弱：
+   1) 字形：显式用黑体(SimHei)渲染全角标点——粗黑蝌蚪字形 vs 等宽西文的
+      细小逗号，一眼可辨（notebook 同款原理：字形的粗细/居中反差）；
+   2) 宽度：全角字符固有占 2 个字符格，半角占 1 格（等宽布局自动保持）；
+   3) 配色：深橙 + 淡橙底，作为辅助色标（黑体缺失时仍有色差可辨）。 */
+.cm-s-excelsql .cm-fw-punct {
+  color: #b35b00;                    /* 深橙：与半角黑色强对比但不过分刺眼 */
+  background: rgba(255, 152, 0, 0.14); /* 淡橙底，区分字符串里的引号 */
+  border-radius: 2px;
+  font-weight: 700;
+  /* 关键：黑体 → 雅黑 → 果黑 逐级 fallback，让全角标点呈现“粗黑方块字形” */
+  font-family: "SimHei", "Microsoft YaHei", "PingFang SC", sans-serif;
+}
+
+.cell-result { border-top: 1px solid var(--border); }
+.cell-result.hidden { display: none; }
+
+.cell-result-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-soft);
+}
+.cell-result-head .step-title h2 { font-size: 13px; }
+.cell-row-count { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.cell-download {
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.cell-download:hover { border-color: var(--text); }
+
+/* 结果区：纵向随内容展开、交给 notebook 整体滚动；仅保留横向滚动给宽表。 */
+.cell-result-wrap { overflow-x: auto; background: var(--card); }
+.cell-result-wrap .placeholder { padding: 14px; }
+
+/* 查询进度条（真实百分比宽度） */
+.cell-progress {
+  position: relative;
+  height: 3px;
+  background: var(--bg-tint);
+  overflow: hidden;
+}
+.cell-progress.hidden { display: none; }
+
+.cell-progress-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.12s ease-out;
+}
+
+/* ── 选择文件后的连续阶段展示（每步 + 耗时） ── */
+.open-stages {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.open-stages:empty { display: none; }
+.open-stage {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  line-height: 1.5;
+}
+.open-stage .stage-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--border-strong);
+}
+.open-stage.active .stage-dot { background: var(--accent); }
+.open-stage.done .stage-dot { background: var(--ok); }
+.open-stage.error .stage-dot { background: var(--danger); }
+.open-stage .stage-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.open-stage .stage-time { flex: 0 0 auto; color: var(--muted-2); }
+.open-stage.active .stage-time { color: var(--accent); }
+.open-stage.done .stage-time { color: var(--ok); }
+
+/* 终态日志的删除按钮：允许用户手工移除该条日志 */
+.open-stage .stage-remove {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted-2);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color .14s, background .14s;
+}
+.open-stage .stage-remove:hover {
+  color: var(--danger);
+  background: var(--bg-tint);
+}
+
+/* ── 最近打开（历史文件） ── */
+/* ── 最近打开（历史文件）：按钮 + 浮层 ── */
+/* 触发按钮：在左栏 pick-card 内，占一行，不撑高布局 */
+.recent-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--muted);
+  font-size: 12px;
+  padding: 6px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: border-color .14s, color .14s, background .14s;
+}
+.recent-btn:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+  background: var(--bg-soft);
+}
+.recent-btn .recent-count { color: var(--muted-2); }
+.recent-btn.hidden { display: none; }
+
+/* 浮层：body 直接子级，fixed 定位 + JS 计算坐标（避开 .card 的
+   overflow:hidden 裁剪与 transform 破坏 fixed） */
+.recent-pop {
+  position: fixed;
+  z-index: 200;
+  width: 300px;
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--card);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(22, 24, 29, 0.12);
+  padding: 10px;
+  gap: 6px;
+}
+.recent-pop.hidden { display: none; }
+.recent-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.recent-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: .04em;
+}
+.recent-clear {
+  border: none;
+  background: transparent;
+  color: var(--muted-2);
+  font-size: 11.5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color .14s, background .14s;
+}
+.recent-clear:hover { color: var(--danger); background: var(--bg-tint); }
+
+.recent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.recent-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  transition: background .14s;
+}
+.recent-item:hover { background: var(--bg-tint); }
+.recent-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-family: var(--mono);
+}
+.recent-time {
+  flex: 0 0 auto;
+  color: var(--muted-2);
+  font-size: 11px;
+}
+.recent-del {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted-2);
+  font-size: 14px;
+  line-height: 1;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color .14s, background .14s;
+}
+.recent-del:hover { color: var(--danger); background: var(--bg-tint); }
+.recent-more {
+  align-self: flex-start;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11.5px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color .14s, background .14s;
+}
+.recent-more:hover { color: var(--accent); background: var(--bg-tint); }
+
+/* 最近组合区（多源模式：复用最近用过的多源组合，一键恢复） */
+.recent-combo-head {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: .04em;
+  margin-bottom: 3px;
+}
+.recent-combo-hint {
+  font-size: 11.5px;
+  color: var(--muted-2);
+  padding: 4px 8px;
+  margin-bottom: 4px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.recent-combo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 4px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.recent-combo-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  transition: background .14s;
+}
+.recent-combo-item:hover { background: var(--bg-tint); }
+.recent-combo-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-family: var(--mono);
+}
+
+/* 缺失文件：条目标红 + 「清除缺失」按钮 */
+.recent-item.recent-missing .recent-name { color: var(--danger); }
+.recent-item.recent-missing .recent-time { color: var(--danger); }
+.recent-del-missing {
+  border: none;
+  background: transparent;
+  color: var(--danger);
+  font-size: 11.5px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  align-self: flex-start;
+  transition: color .14s, background .14s;
+}
+.recent-del-missing:hover {
+  color: #fff;
+  background: var(--danger);
+}
+
+/* 源卡浮层底部：选择本地文件入口（与历史列表分隔） */
+.recent-local {
+  margin-top: 2px;
+  width: 100%;
+  border: none;
+  border-top: 1px solid var(--border);   /* 先复位再画上边分隔线 */
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  padding: 8px 8px 4px;
+  cursor: pointer;
+  transition: color .14s;
+  text-align: left;
+}
+.recent-local:hover { color: var(--accent); }
+
+/* ── SQL 自动补全弹层（黑白灰极简风，贴合同主题） ── */
+.CodeMirror-hints {
+  position: absolute;
+  z-index: 10;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 3px;
+  max-height: 20em;
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--card);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow: 0 6px 24px rgba(22, 24, 29, 0.12);
+  box-sizing: border-box;
+}
+.CodeMirror-hint {
+  margin: 0;
+  padding: 3px 9px;
+  border-radius: 4px;
+  white-space: pre;
+  color: var(--text);
+  cursor: pointer;
+}
+li.CodeMirror-hint-active {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* ── 虚拟滚动结果表格 ── */
+/* 行数超过阈值时，结果区从「随内容展开」切换为固定高度的独立滚动容器，
+   只渲染可视窗口内的行，保证万行结果不卡顿。 */
+.cell-result-wrap.vscroll {
+  height: 420px;
+  overflow: auto;
+}
+/* 固定行高：让 JS 的 spacer 高度与实际行高精确一致，滚动才不跳位 */
+.cell-result-wrap.vscroll th,
+.cell-result-wrap.vscroll td {
+  height: 32px;
+  box-sizing: border-box;
+}
+.vscroll-spacer-row {
+  background: transparent !important;   /* 覆盖 nth-child/hover 底色，spacer 不可见 */
+  pointer-events: none;
+}
+.vscroll-spacer-row td {
+  line-height: 0;
+  padding: 0;
+  border: none;
+}
+
+/* ── 底部合计行 ── */
+/* 表格末行的合计：数字列 SUM、非数字列「—」、首格「合计」标签。
+   结果区可滚动（虚拟滚动或表格超高）时吸附在可视区底部，滚到
+   任意位置都能看到合计；表短时就是普通末行。 */
+tfoot tr.totals-row {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+}
+tfoot tr.totals-row td {
+  background: var(--bg-soft);
+  border-top: 2px solid var(--border);
+  font-weight: 600;
+  color: var(--text);
+}
+tfoot tr.totals-row td.totals-label {
+  color: var(--muted);
+}

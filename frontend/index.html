@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EXCEL → SQL 查询台</title>
+  <link rel="stylesheet" href="./codemirror.css?v=1">
+  <link rel="stylesheet" href="./style.css?v=25">
+</head>
+<body>
+  <div class="vg-glow" aria-hidden="true"></div>
+  <div class="vg-grid" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <button id="sidebarToggle" class="sidebar-toggle" type="button" title="数据源/字段侧栏" aria-label="切换侧栏">
+        <svg viewBox="0 0 16 14" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M1.5 2h13M1.5 7h13M1.5 12h13"></path>
+        </svg>
+      </button>
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+          <rect x="3" y="4" width="13" height="16" rx="1"></rect>
+          <path d="M6 8h7M6 12h7M6 16h4"></path>
+          <path d="M18 13l1.5 2.5L18 18" ></path>
+        </svg>
+      </span>
+      <div class="brand-text">
+        <div class="brand-title">EXCEL <span class="brand-arrow">→</span> SQL</div>
+        <div class="brand-sub">QUERY CONSOLE · 本地路径直读 · 不复制文件</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <div class="mode-switch" role="tablist" aria-label="查询模式">
+        <button id="modeSingleBtn" class="mode-btn active" type="button">单文件</button>
+        <button id="modeMultiBtn" class="mode-btn" type="button">多源关联</button>
+      </div>
+      <span class="live"><i class="dot" aria-hidden="true"></i>EXCEL / CSV</span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- 左：数据源 + 字段 -->
+    <aside class="panel" id="leftPanel">
+      <section class="card step pick-card">
+        <!-- 单文件模式 -->
+        <div id="singleModeBox">
+          <div class="pick-line">
+            <button id="pickBtn" class="btn primary" type="button">
+              <svg viewBox="0 0 16 14" fill="none" stroke="currentColor" stroke-width="1.4">
+                <path d="M1.5 3.5A1.5 1.5 0 0 1 3 2h3l1.8 2.2H13a1.5 1.5 0 0 1 1.5 1.5v5.3a1.5 1.5 0 0 1-1.5 1.5H3A1.5 1.5 0 0 1 1.5 11z"></path>
+              </svg>
+              选择文件
+            </button>
+          </div>
+          <div id="fileInfo" class="file-info hidden">
+            <span class="file-icon" aria-hidden="true">
+              <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3">
+                <path d="M4 1.5h4.5L11.5 4.5v8a.8.8 0 0 1-.8.8h-6A.8.8 0 0 1 4 12.5z"></path>
+                <path d="M8.5 1.5v3h3"></path>
+              </svg>
+            </span>
+            <span id="fileName" class="file-name" title=""></span>
+            <button id="clearSingleBtn" class="btn remove-btn" type="button" title="去除已选择的文件">去除</button>
+          </div>
+        </div>
+
+        <!-- 多源关联模式 -->
+        <div id="multiModeBox" class="hidden">
+          <div id="sourceList" class="source-list"></div>
+          <button id="addSourceBtn" class="btn" type="button">+ 添加数据源</button>
+        </div>
+
+        <div id="uploadStatus" class="status-msg"></div>
+        <div id="openStages" class="open-stages"></div>
+        <button id="recentBtn" class="recent-btn hidden" type="button" title="查看最近打开的文件">
+          <svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+            <path d="M7 1.5a5.5 5.5 0 1 0 5.3 4M7 1.5V4m0-2.5h2.5M10.6 1.8 12.3 4l-1.7 2.2"/>
+          </svg>
+          最近打开 <span id="recentCount" class="recent-count"></span>
+        </button>
+      </section>
+
+      <section class="card step" id="fieldsCard">
+        <div class="step-head">
+          <div class="step-title">
+            <h2>数据字段 <span id="sourceLabel" class="muted"></span></h2>
+          </div>
+        </div>
+        <input id="fieldSearch" class="field-search" type="text"
+          placeholder="搜索字段…" spellcheck="false" autocomplete="off">
+        <div id="fieldsBox">
+          <p class="placeholder">读取字段后，这里自动列出列名与类型</p>
+        </div>
+      </section>
+    </aside>
+
+    <!-- 分栏拖拽器 -->
+    <div class="splitter" id="splitter" aria-hidden="true"></div>
+
+    <!-- 右：SQL Notebook + 结果 -->
+    <section class="panel grow">
+      <div class="card step">
+        <div class="step-head">
+          <div class="step-title">
+            <h2>编写 SQL <span class="muted">—— 单文件用 <code>data</code>，多源用别名</span></h2>
+          </div>
+          <div class="notebook-actions">
+            <div class="nb-params">
+              <label id="sheetCtrl" class="ctrl">
+                工作表
+                <select id="sheetInput">
+                  <option value="">默认（第一张）</option>
+                </select>
+              </label>
+            </div>
+          </div>
+        </div>
+        <div id="notebook" class="notebook"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 大纲浮轨：置于 body 直接子级，避免 .card.step 的 transform 动画使其 fixed 定位失效 -->
+  <div id="cellOutline" class="cell-outline" aria-hidden="false"></div>
+
+  <!-- 最近打开浮层：body 直接子级（.card 的 overflow:hidden 会裁剪它），
+       fixed 定位 + JS 计算位置，避开 .card.step 的 transform 破坏 fixed -->
+  <div id="recentPop" class="recent-pop hidden"></div>
+
+  <script src="./codemirror.js?v=1"></script>
+  <script src="./mode/sql/sql.js?v=1"></script>
+  <script src="./addon/comment/comment.js?v=1"></script>
+  <script src="./addon/hint/show-hint.js?v=1"></script>
+  <script src="./addon/hint/sql-hint.js?v=1"></script>
+  <script src="./app.js?v=39"></script>
+</body>
+</html>

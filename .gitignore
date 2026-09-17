@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# 上传的 Excel 与临时文件（按路径引用模式不再复制文件，backend/uploads 仅作兼容清理）
+backend/uploads/
+.tmp/
+.tmpx/
+.tmp_test.xlsx
+*.whl
+
+# 打包产物（体积大且可由源码重建，不应入库）
+dist/
+build/
+*.spec.bak
+packaging_dbg.spec
+
+# 本地运行时数据
+cache/
+duckdb_ext/
+app.log
+logs/
+.tmp_pyinstaller/
+
+# 备份/测试残迹
+frontend.bak/
+.uitest/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

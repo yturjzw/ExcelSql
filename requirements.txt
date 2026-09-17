@@ -1,0 +1,9 @@
+# 依赖说明：
+# - excel 扩展自 DuckDB 1.1.0 引入。
+# - 你的环境已升级到 Python 3.12，可用最新版 duckdb（>=1.4 修复了老版本下载
+#   扩展时在 Windows 中文控制台因 GBK 字节导致 UnicodeDecodeError 的问题）。
+# - 若必须用 Python 3.8，需把 duckdb 钉为 duckdb>=1.1.0,<1.2.0（见 README）。
+# - 按路径引用模式不再依赖 python-multipart（无文件上传）。
+fastapi>=0.110
+uvicorn>=0.29
+duckdb>=1.4.0
