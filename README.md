@@ -1,4 +1,5 @@
 # Excel SQL 查询台（按路径引用模式）
+<img width="1900" height="909" alt="image" src="https://github.com/user-attachments/assets/0f3bcc1a-58b8-4c56-82ec-12152e1908d5" />
 
 一个静态前端 + Python 后端的本地查询工具：**按本地文件路径直接引用 Excel**（不复制文件），自动展示字段，直接用 SQL 检索数据。
 
