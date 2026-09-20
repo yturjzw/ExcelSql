@@ -13,9 +13,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import json
 import os
 import re
 import socket
+import sqlite3
 import string
 import sys
 import tempfile
@@ -46,7 +48,7 @@ BASE_DIR = _resource_base()
 FRONTEND_DIR = BASE_DIR / "frontend"
 
 # 打包时嵌入的 DuckDB 扩展目录（内含 v{version}/windows_amd64/excel.duckdb_extension）
-# 用于离线 LOAD excel，摆脱对用户机器 .duckdb 缓存的依赖
+# 用于离线 LOAD excel / mysql_scanner，摆脱对用户机器 .duckdb 缓存的依赖
 BUNDLED_EXT_DIR = BASE_DIR / "duckdb_ext"
 
 # 支持的 Excel 扩展名
@@ -69,6 +71,80 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------- SQLite 持久化（前端 localStorage 迁移目标） ----------
+# 本地桌面应用：历史文件、多源组合、Doris 连接、SQL 会话统一落 SQLite 数据库，
+# 摆脱 WebView2 profile/localStorage 的绑定（清缓存/换 profile 不丢、可备份、可查询）。
+# 库文件放在 %LOCALAPPDATA%\ExcelSqlConsole\app.sqlite（与 app.log / diagnose.txt 同目录）。
+_STORE_DB: "sqlite3.Connection | None" = None
+_STORE_LOCK = threading.Lock()
+
+
+def _store_dir() -> Path:
+    """SQLite 库文件目录：优先 LOCALAPPDATA；不可用则回退 exe 所在目录（便于排查）。"""
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        p = Path(local) / "ExcelSqlConsole"
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except OSError:
+            pass
+    return Path(os.path.dirname(sys.executable)) if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
+
+
+def _get_store() -> "sqlite3.Connection":
+    """返回进程级 SQLite 连接（首次打开建表）；后续读写复用。"""
+    global _STORE_DB
+    if _STORE_DB is None:
+        db_path = _store_dir() / "app.sqlite"
+        _STORE_DB = sqlite3.connect(str(db_path), check_same_thread=False)
+        _STORE_DB.execute("PRAGMA journal_mode = WAL")
+        _STORE_DB.execute(
+            "CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)"
+        )
+        _STORE_DB.commit()
+    return _STORE_DB
+
+
+def _store_get(key: str) -> str | None:
+    """读取一个 key 的 JSON 字符串；不存在返回 None。"""
+    with _STORE_LOCK:
+        con = _get_store()
+        row = con.execute("SELECT v FROM kv WHERE k = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _store_set(key: str, value: str) -> None:
+    """写入一个 key 的 JSON 字符串（upsert）。"""
+    with _STORE_LOCK:
+        con = _get_store()
+        con.execute(
+            "INSERT INTO kv (k, v) VALUES (?, ?) "
+            "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            (key, value),
+        )
+        con.commit()
+
+
+def _store_remove(key: str) -> None:
+    """删除一个 key。"""
+    with _STORE_LOCK:
+        con = _get_store()
+        con.execute("DELETE FROM kv WHERE k = ?", (key,))
+        con.commit()
+
+
+def _close_store() -> None:
+    """应用退出时关闭 SQLite 连接（desktop.shutdown() → app.shutdown() 调用）。"""
+    global _STORE_DB
+    if _STORE_DB is not None:
+        try:
+            _STORE_DB.close()
+        except Exception:
+            pass
+        _STORE_DB = None
 
 
 # ---------- 工具函数 ----------
@@ -193,6 +269,73 @@ def _load_excel(con: duckdb.DuckDBPyConnection) -> None:
     except Exception:
         con.execute("INSTALL excel;")
         con.execute("LOAD excel;")
+
+
+def _load_mysql(con: duckdb.DuckDBPyConnection) -> None:
+    """加载 mysql_scanner 扩展（Doris 走 MySQL 协议，靠它 ATTACH 直连）。
+
+    与 _load_excel 同款策略：打包后优先随包离线 LOAD（mysql_scanner.duckdb_extension
+    已复制进 duckdb_ext/）；源码运行时回退 LOAD，缺失则 INSTALL 联网下载。
+    注：Doris 不认 DuckDB mysql 扩展默认的事务包裹（START TRANSACTION READ ONLY），
+    必须关掉事务隔离，否则任何查询都会报 mismatched input 'READ'。
+    """
+    bundled = BUNDLED_EXT_DIR / "mysql_scanner.duckdb_extension"
+    if bundled.is_file():
+        try:
+            con.execute(f"LOAD '{_sql_path(bundled)}'")
+        except Exception:
+            pass  # 回退到默认缓存/联网安装
+    try:
+        con.execute("LOAD mysql;")
+    except Exception:
+        con.execute("INSTALL mysql;")
+        con.execute("LOAD mysql;")
+    try:
+        con.execute("SET mysql_enable_transactions = false")   # P0：Doris 兼容必须
+    except Exception:
+        pass
+
+
+# ---------- 进程级共享连接（Doris ATTACH 复用） ----------
+# 首次查询某 Doris 时建共享 DuckDB 连接并 ATTACH（~1.8s 一次性开销），之后查询
+# 直接复用；含 Doris 源的任务持 _SHARED_LOCK 串行执行（共享连接上的视图/状态不能并发）。
+# 应用退出（shutdown()）时统一关闭。
+_SHARED_LOCK = threading.RLock()
+_SHARED_CON: "duckdb.DuckDBPyConnection | None" = None
+_DORIS_ATTACHED: dict[tuple, str] = {}   # conn_key -> attach_alias（已 ATTACH，进程级缓存）
+
+
+def _get_shared_con() -> "duckdb.DuckDBPyConnection":
+    """返回进程级共享 DuckDB 连接（首次创建：LOAD excel+mysql 扩展、SET 进度条）。"""
+    global _SHARED_CON
+    if _SHARED_CON is None:
+        con = duckdb.connect()
+        # 与 _run_query_task 原来对每个任务连接做的初始化一致，共享连接只做一次
+        con.execute("SET enable_progress_bar = true")
+        con.execute("SET enable_progress_bar_print = false")
+        con.execute("SET progress_bar_time = 0")
+        _load_excel(con)
+        _load_mysql(con)   # 内部已 LOAD mysql_scanner + SET 关事务
+        _SHARED_CON = con
+    return _SHARED_CON
+
+
+def _invalidate_shared_con() -> None:
+    """丢弃共享连接（如 Doris 掉线需要重建）。必须在持有 _SHARED_LOCK 时调用。"""
+    global _SHARED_CON
+    if _SHARED_CON is not None:
+        try:
+            _SHARED_CON.close()
+        except Exception:
+            pass
+        _SHARED_CON = None
+    _DORIS_ATTACHED.clear()
+
+
+def _close_shared_con() -> None:
+    """应用退出：关闭共享连接（desktop.py 的 shutdown() 调用）。"""
+    with _SHARED_LOCK:
+        _invalidate_shared_con()
 
 
 def _list_drives() -> list[str]:
@@ -635,6 +778,111 @@ def _describe(file_path: Path, sheet: str | None = None) -> list[dict]:
         _cleanup_tmp_files(tmp_files)
 
 
+def _describe_doris(conn: dict, db: str, table: str) -> list[dict]:
+    """返回 Doris 一张表的列元数据（复用共享连接 + 全局锁，避免重复建连）。
+
+    数据源走 information_schema.columns（而非 DESCRIBE / SHOW FULL COLUMNS）：
+      - DESCRIBE 只给 column_name/column_type/null，且 key/default/extra 全为 None，
+        无注释列；SHOW FULL COLUMNS/SHOW COLUMNS FROM 会被 DuckDB 本地解析器拦截，
+        无法下推 Doris。实测 information_schema.columns 返回 24 列，COLUMN_COMMENT
+        每列都有中文注释、COLUMN_KEY 标 UNI（主键）或空串、IS_NULLABLE 标 YES/NO、
+        COLUMN_TYPE 保留 Doris 真实类型名（如 decimalv3(18,4)）。
+    """
+    with _SHARED_LOCK:
+        con = _get_shared_con()   # 已加载 mysql 扩展 + ATTACH 缓存
+        conn_key = (conn["host"], conn["port"], conn["user"], conn["password"])
+        attach_alias = _DORIS_ATTACHED.get(conn_key)
+        if attach_alias is None:
+            attach_alias = f"__doris_{len(_DORIS_ATTACHED) + 1}"
+            con.execute(_doris_attach_sql(conn, attach_alias))
+            _DORIS_ATTACHED[conn_key] = attach_alias
+        # db/table 作字符串字面量进 WHERE（表名可能含点，用 = 精确匹配避免 LIKE 歧义）
+        dlit = db.replace("'", "''")
+        tlit = table.replace("'", "''")
+        cur = con.execute(
+            f"SELECT column_name, column_type, column_key, is_nullable, column_comment "
+            f"FROM {attach_alias}.information_schema.columns "
+            f"WHERE table_schema = '{dlit}' AND table_name = '{tlit}' "
+            f"ORDER BY ordinal_position"
+        )
+        out = []
+        for name, ctype, ckey, nullable, comment in cur.fetchall():
+            out.append({
+                "name": str(name),
+                "type": str(ctype),
+                "is_key": bool(ckey and str(ckey).strip() != ""),
+                "comment": (str(comment).strip() if comment is not None else "") or None,
+            })
+        return out
+
+
+def _doris_list(conn: dict) -> dict:
+    """连接 Doris 并返回 {dbs: [...], tables: {db: [table,...]}}（供前端选表）。
+
+    实现：ATTACH 不带 db（暴露所有库为 schema），SHOW ALL TABLES 一次拿到
+    (attach, schema, table, 列名数组, 类型数组)，据此聚合出库→表清单。
+    """
+    with _SHARED_LOCK:
+        con = _get_shared_con()   # 已加载 mysql 扩展；ATTACH 缓存复用
+        conn_key = (conn["host"], conn["port"], conn["user"], conn["password"])
+        attach_alias = _DORIS_ATTACHED.get(conn_key)
+        if attach_alias is None:
+            attach_alias = f"__doris_{len(_DORIS_ATTACHED) + 1}"
+            con.execute(_doris_attach_sql(conn, attach_alias))
+            _DORIS_ATTACHED[conn_key] = attach_alias
+        rows = con.execute("SHOW ALL TABLES").fetchall()
+        dbs: set[str] = set()
+        tables: dict[str, list[str]] = {}
+        for r in rows:
+            # (attach, schema, table, [cols], [types], is_column?)
+            if len(r) < 3:
+                continue
+            schema = str(r[1])
+            tname = str(r[2])
+            dbs.add(schema)
+            tables.setdefault(schema, []).append(tname)
+        for lst in tables.values():
+            lst.sort(key=str.lower)
+        return {"dbs": sorted(dbs, key=str.lower), "tables": tables}
+
+
+class DbProbeRequest(BaseModel):
+    conn: DbConn | None = None
+
+
+@app.post("/api/db_probe")
+async def db_probe(payload: DbProbeRequest) -> dict:
+    """测试数据库连接并列出库/表（供前端「连接 Doris」表单校验与选表）。
+
+    只读操作（READ_ONLY）。失败时返回 HTTP 400 + 可读错误信息（认证/网络原因）。
+    """
+    conn = payload.conn
+    if not conn or not (conn.host or "").strip():
+        raise HTTPException(status_code=400, detail="请填写数据库主机")
+    conn_dict = {
+        "host": (conn.host or "").strip() or "127.0.0.1",
+        "port": int(conn.port or 9030),
+        "user": (conn.user or "").strip() or "root",
+        "password": conn.password or "",
+        "db": (conn.db or "").strip(),
+    }
+    try:
+        listing = await asyncio.to_thread(_doris_list, conn_dict)
+        return {
+            "ok": True,
+            "dbs": listing["dbs"],
+            "tables": listing["tables"],
+            "server": f"{conn_dict['host']}:{conn_dict['port']}",
+        }
+    except Exception as e:
+        msg = str(e)
+        if "access denied" in msg.lower() or "authentication" in msg.lower():
+            raise HTTPException(status_code=400, detail=f"认证失败，请检查用户名/密码: {msg[:200]}")
+        if "connect" in msg.lower() or "timeout" in msg.lower():
+            raise HTTPException(status_code=400, detail=f"无法连接数据库: {msg[:200]}")
+        raise HTTPException(status_code=400, detail=f"连接失败: {msg[:200]}")
+
+
 def _jsonable_value(v):
     """把单个 DuckDB 结果值转成可 JSON 序列化的 Python 值。"""
     import datetime as _dt
@@ -681,16 +929,36 @@ class OpenRequest(BaseModel):
 
 
 class Source(BaseModel):
-    """一个数据源 = 文件路径 + 工作表 + SQL 别名。"""
+    """一个数据源 = 本地文件 或 远程数据库表 + SQL 别名。
+
+    kind: "file"（默认，兼容旧数据）| "doris"
+    doris 源使用 conn（完整连接配置，前端内联携带）+ db + table。
+    """
 
     alias: str
-    path: str
+    path: str = ""          # file 源必填；doris 源为空
     sheet: str | None = None
+    kind: str = "file"
+    conn: DbConn | None = None   # doris：完整连接配置
+    db: str = ""            # doris：数据库名
+    table: str = ""         # doris：表名
+
+
+class DbConn(BaseModel):
+    """一个数据库连接配置（前端存 localStorage，查询时随源内联传给后端）。"""
+
+    id: str = ""
+    name: str = ""
+    host: str = ""
+    port: int = 9030
+    user: str = ""
+    password: str = ""
+    db: str = ""
 
 
 class QueryRequest(BaseModel):
     sources: list[Source]
-    sql: str
+    sql: str = ""       # /api/query 必填（内部校验）；/api/describe 复用本模型但不读 sql，给默认空串防 422
     limit: int = DEFAULT_LIMIT
 
 
@@ -705,6 +973,36 @@ class ExportRequest(BaseModel):
 @app.get("/api/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+class StoreGetRequest(BaseModel):
+    keys: list[str]
+
+
+class StoreSetRequest(BaseModel):
+    kvs: dict[str, str | None]   # key -> JSON 字符串；值为 None 表示删除该 key
+
+
+@app.post("/api/store/get")
+async def store_get(payload: StoreGetRequest) -> dict:
+    """批量读取持久化 key（返回 {key: JSON字符串}；缺省 key 不含于结果）。"""
+    out: dict[str, str] = {}
+    for k in payload.keys:
+        v = _store_get(k)
+        if v is not None:
+            out[k] = v
+    return {"values": out}
+
+
+@app.post("/api/store/set")
+async def store_set(payload: StoreSetRequest) -> dict:
+    """批量写入/删除持久化 key；value 为 None 视为删除。"""
+    for k, v in payload.kvs.items():
+        if v is None:
+            _store_remove(k)
+        else:
+            _store_set(k, v)
+    return {"ok": True}
 
 
 @app.post("/api/pick_file")
@@ -779,7 +1077,7 @@ async def open_excel(payload: OpenRequest) -> dict:
 
 
 def _prepare_sources(payload_sources: list[Source]) -> list[dict]:
-    """校验并解析多数据源：返回 [{alias, path(已解析), sheet, resolved_path}]。"""
+    """校验并解析多数据源：返回 [{alias, kind, ...}]."""
     if not payload_sources:
         raise HTTPException(status_code=400, detail="至少需要一个数据源")
 
@@ -791,17 +1089,234 @@ def _prepare_sources(payload_sources: list[Source]) -> list[dict]:
             raise HTTPException(status_code=400, detail=f"别名重复: {alias}")
         seen_aliases.add(alias.lower())
 
-        # 校验 sheet 字面量（复用 _sheet_literal 的非法字符检查，但不消费结果）
-        _sheet_literal(src.sheet)
-
-        resolved = _resolve_path(src.path)
-        prepared.append({
-            "alias": alias,
-            "path": src.path,
-            "resolved": resolved,
-            "sheet": (src.sheet or "").strip() or None,
-        })
+        kind = (src.kind or "file").strip().lower()
+        if kind == "doris":
+            # 数据库源（连接级）：只校验连接配置；db/table 可选（连接可访问全部库表）。
+            # 用户可在 SQL 里显式写 `FROM 别名.库.表`，或由字段区当前选中的库表作为
+            # `FROM 别名` 的默认表；两者都不给时后端在执行前报错提示。
+            conn = src.conn
+            if not conn or not (conn.host or "").strip():
+                raise HTTPException(status_code=400, detail=f"{alias}: 未指定主机")
+            dbname = (src.db or conn.db or "").strip()
+            prepared.append({
+                "alias": alias,
+                "kind": "doris",
+                "conn": {
+                    "host": (conn.host or "").strip() or "127.0.0.1",
+                    "port": int(conn.port or 9030),
+                    "user": (conn.user or "").strip() or "root",
+                    "password": conn.password or "",
+                    "db": (conn.db or "").strip(),
+                },
+                "db": dbname,
+                "table": str(src.table or "").strip(),
+            })
+        else:
+            # 文件源：现有逻辑
+            _sheet_literal(src.sheet)
+            resolved = _resolve_path(src.path)
+            prepared.append({
+                "alias": alias,
+                "kind": "file",
+                "path": src.path,
+                "resolved": resolved,
+                "sheet": (src.sheet or "").strip() or None,
+            })
     return prepared
+
+
+def _code_tags(sql: str) -> list[str]:
+    """返回与 SQL 等长的类型标记：'c'（代码）/ 's'（字符串/引号标识符）/ 'x'（注释）。
+
+    供 _finalize_doris_sql 做「尾部裁剪到最后一个真实代码字符」用，避免把 SQL
+    末尾的字符串字面量（如 'a--b'）误当注释裁掉。
+    """
+    tags = ["c"] * len(sql)
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c in ("'", '"', "`"):
+            q = c
+            j = i + 1
+            while j < n:
+                if sql[j] == "\\":
+                    j += 2
+                    continue
+                if sql[j] == q:
+                    break
+                j += 1
+            for k in range(i, min(j + 1, n)):
+                tags[k] = "s"
+            i = j + 1
+        elif c == "-" and i + 1 < n and sql[i + 1] == "-":
+            j = sql.find("\n", i)
+            j = n if j == -1 else j
+            for k in range(i, j):
+                tags[k] = "x"
+            i = j
+        elif c == "#":
+            j = sql.find("\n", i)
+            j = n if j == -1 else j
+            for k in range(i, j):
+                tags[k] = "x"
+            i = j
+        elif c == "/" and i + 1 < n and sql[i + 1] == "*":
+            j = sql.find("*/", i + 2)
+            j = n - 2 if j == -1 else j + 2
+            for k in range(i, j):
+                tags[k] = "x"
+            i = j
+        else:
+            i += 1
+    return tags
+
+
+def _finalize_doris_sql(sql: str, limit: int) -> str:
+    """Doris 源执行的最终 SQL：剥尾部注释/分号；若顶层无 LIMIT 则追加（让 LIMIT 下推）。
+
+    视图包装会把 LIMIT 吃掉导致全表拉取（见性能诊断），Doris 源必须直接执行。
+    基于 _code_tags 定位最后一个真实「代码」字符：尾部注释/分号剥掉，
+    字符串字面量（'a--b'）里的内容保留；子查询里的 LIMIT 不影响顶层判断。
+    """
+    tags = _code_tags(sql)
+    # 最后一个「内容」字符（代码 c 或字符串 s）的位置；其后只允许空白/分号/注释。
+    # 注意字符串 s 也是合法内容：SQL 以字面量结尾（如 WHERE name = 'a--b'）时必须保留。
+    last_content = -1
+    for i, t in enumerate(tags):
+        if t in ("c", "s"):
+            last_content = i
+    if last_content < 0:
+        return sql
+    core = sql[: last_content + 1].rstrip()
+    # 剥末尾分号（允许 ; ; 连续 / 分号+空白）
+    while core.endswith(";"):
+        core = core[:-1].rstrip()
+    # 顶层末尾是否已有 LIMIT（跨空白；允许 LIMIT n / LIMIT n OFFSET m / LIMIT ALL）
+    if re.search(r"\blimit\b\s+(\d+|all)(\s+offset\s+\d+)?\s*$", core, re.IGNORECASE):
+        return core
+    return f"{core}\nLIMIT {limit}"
+
+
+def _rewrite_doris_sql(sql: str, sources: list[dict]) -> str:
+    """把用户 SQL 里的 doris 别名（表引用位置）展开成三段路径 + AS 别名。
+
+    mysql_scanner 扩展在「视图包装后聚合」有绑定 bug（见 P0 实测），但直接用
+    mysql 表（三段引用）完全正常。因此 doris 源不建视图，而是在执行前把
+    SQL 中 FROM / JOIN /, 后的表引用位置展开：
+
+      显式三段（连接级源，推荐）：
+          FROM d1.库.表          → FROM __doris_1."库"."表" AS d1
+          JOIN d1.库.表 ON ...   → JOIN __doris_1."库"."表" AS d1 ON ...
+      裸别名（有默认库表时，向后兼容）：
+          FROM d1                → FROM __doris_1."默认库"."默认表" AS d1
+      裸别名但无默认库表：报错，提示改用显式三段或先在字段区选库表。
+
+    列引用（d1.PERIOD）保留不动（d1 仍是表别名）。只处理 doris 源；file 源
+    别名仍是视图，不展开。
+    """
+    def _unquote_ident(tok: str) -> str:
+        tok = tok.strip()
+        if len(tok) >= 2 and tok[0] == '"' and tok[-1] == '"':
+            return tok[1:-1].replace('""', '"')
+        return tok
+
+    # alias -> {attach, db, table}；db/table 可能为空（连接级源未选默认表）
+    doris_info: dict[str, dict] = {}
+    for s in sources:
+        if s.get("kind") == "doris" and s.get("_attach_alias"):
+            doris_info[s["alias"]] = {
+                "attach": s["_attach_alias"],
+                "db": (s.get("db") or "").strip(),
+                "table": (s.get("table") or "").strip(),
+            }
+    if not doris_info:
+        return sql
+
+    # 标识符：裸 [字母数字下划线]+ 或 "..."双引号包裹
+    ident = r'(?:"(?:[^"]|"")*"|[A-Za-z0-9_]+)'
+    # 表引用后常见的子句关键字：裸表别名捕获时不能把这些字吞进去
+    reserved_trail = (
+        "where|on|group|order|limit|offset|having|union|except|intersect|"
+        "left|right|inner|outer|full|cross|join|natural|as|using|qualify|"
+        "window|fetch|first|next|rows|select|from|with|asc|desc|all|distinct|"
+        "option|pivot|unpivot|returning|into|then|else|end|over|partition|range"
+    )
+
+    def _tbl_alias(m, as_group, bare_group, default):
+        """取用户跟在表引用后的手动别名（AS x / 裸 x）；无则用默认连接别名。"""
+        tok = None
+        if as_group and m.group(as_group):
+            tok = m.group(as_group)
+        elif bare_group and m.group(bare_group):
+            tok = m.group(bare_group)
+        return _unquote_ident(tok) if tok else default
+
+    # 按别名长短降序处理，避免短别名先替换吃掉长别名前缀
+    for alias in sorted(doris_info, key=len, reverse=True):
+        info = doris_info[alias]
+        a = re.escape(alias)
+
+        # 1) 显式三段：FROM/JOIN/, 后 别名 . 库 . 表，可选手动表别名（AS x / 裸 x）
+        #    分组：1=kw 2=库 3=表 4=AS别名 5=裸别名
+        explicit = re.compile(
+            rf"(?<!\w)(FROM|JOIN|,)\s+{a}\s*\.\s*({ident})\s*\.\s*({ident})"
+            rf"(?:\s+AS\s+({ident})|\s+(?!(?:{reserved_trail})\b)({ident}))?(?![\w.])",
+            re.IGNORECASE,
+        )
+        def _ex_sub(m, _info=info, _alias=alias):
+            kw = m.group(1)
+            db = _unquote_ident(m.group(2))
+            tbl = _unquote_ident(m.group(3))
+            talias = _tbl_alias(m, 4, 5, _alias)
+            dbq = '"' + db.replace('"', '""') + '"'
+            tblq = '"' + tbl.replace('"', '""') + '"'
+            return f"{kw} {_info['attach']}.{dbq}.{tblq} AS {talias}"
+        sql = explicit.sub(_ex_sub, sql)
+
+        # 2) 裸别名：FROM/JOIN/, 后 别名，可选手动表别名（AS x / 裸 x）
+        #    分组：1=kw 2=AS别名 3=裸别名
+        bare = re.compile(
+            rf"(?<!\w)(FROM|JOIN|,)\s+{a}"
+            rf"(?:\s+AS\s+({ident})|\s+(?!(?:{reserved_trail})\b)({ident}))?(?![\w.])",
+            re.IGNORECASE,
+        )
+        if info["db"] and info["table"]:
+            dbq = '"' + info["db"].replace('"', '""') + '"'
+            tblq = '"' + info["table"].replace('"', '""') + '"'
+            path = f"{info['attach']}.{dbq}.{tblq}"
+            def _bare_sub(m, _path=path, _alias=alias):
+                return f"{m.group(1)} {_path} AS {_tbl_alias(m, 2, 3, _alias)}"
+            sql = bare.sub(_bare_sub, sql)
+        elif bare.search(sql):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"别名 {alias} 未指定库表：请在 SQL 写 FROM {alias}.库.表，"
+                    f"或在数据字段区为 {alias} 选择库表"
+                ),
+            )
+    return sql
+
+
+def _doris_attach_sql(conn: dict, attach_alias: str, db: str | None = None) -> str:
+    """构造 Doris ATTACH 语句（TYPE mysql, READ_ONLY）。
+
+    db 缺省时用连接配置里的默认库。注意：为支持同时引用多库的表（一次 ATTACH 暴露
+    该连接的所有库为 schema），实际实现里始终 ATTACH 不带 db；db 参数保留用于未来
+    指定默认库的场景。
+    """
+    host = conn.get("host") or "127.0.0.1"
+    port = conn.get("port") or 9030
+    user = conn.get("user") or "root"
+    pw = conn.get("password") or ""
+    parts = [f"host={host}", f"port={port}", f"user={user}"]
+    if pw:
+        parts.append(f"passwd={pw}")
+    # 注意：不带 db，让 Doris 所有库都映射为 DuckDB schema
+    conn_str = " ".join(parts)
+    # 别名进 SQL 必须加双引号防注入（ATTACH 的别名是标识符）
+    quoted = '"' + attach_alias.replace('"', '""') + '"'
+    return f"ATTACH '{conn_str}' AS {quoted} (TYPE mysql, READ_ONLY)"
 
 
 def _register_sources(con: duckdb.DuckDBPyConnection, sources: list[dict], all_varchar: bool = False,
@@ -824,9 +1339,24 @@ def _register_sources(con: duckdb.DuckDBPyConnection, sources: list[dict], all_v
         expr = None
         alias_status = "direct"
 
-        # CSV 不参与 parquet 缓存（本就快），直接走 read_csv 表达式，
-        # 避免落入「parquet=None → read_parquet('None')」的畸形兜底分支。
-        if s["resolved"].suffix.lower() == ".csv":
+        # 数据库源（Doris）：不建视图（mysql 扩展视图+聚合有绑定 bug，见 P0 实测），
+        # 只负责 ATTACH；同连接只 ATTACH 一次（进程级缓存），SQL 里别名由
+        # _rewrite_doris_sql 展开。ATTACH 在共享连接上进行（调用方已持 _SHARED_LOCK）。
+        if s.get("kind") == "doris":
+            conn = s["conn"]
+            conn_key = (conn["host"], conn["port"], conn["user"], conn["password"])
+            attach_alias = _DORIS_ATTACHED.get(conn_key)
+            if attach_alias is None:
+                attach_alias = f"__doris_{len(_DORIS_ATTACHED) + 1}"
+                con.execute(_doris_attach_sql(conn, attach_alias))
+                _DORIS_ATTACHED[conn_key] = attach_alias
+            s["_attach_alias"] = attach_alias
+            alias_status = "doris"
+            status[s["alias"]] = alias_status
+            continue
+        elif s["resolved"].suffix.lower() == ".csv":
+            # CSV 不参与 parquet 缓存（本就快），直接走 read_csv 表达式，
+            # 避免落入「parquet=None → read_parquet('None')」的畸形兜底分支。
             expr = _build_source_expr(s["resolved"], s["sheet"], all_varchar=False, tmp_out=tmp_files)
             alias_status = "csv"
         elif not all_varchar:
@@ -869,6 +1399,21 @@ async def describe_sources(payload: QueryRequest) -> dict:
     sources = _prepare_sources(payload.sources)
     result = []
     for s in sources:
+        if s.get("kind") == "doris":
+            # 数据库源：列来自 ATTACH 后 DESCRIBE，无 sheet/无预构建
+            columns = await asyncio.to_thread(
+                _describe_doris, s["conn"], s["db"], s["table"]
+            )
+            result.append({
+                "alias": s["alias"],
+                "kind": "doris",
+                "path": "",
+                "filename": f"{s['db']}.{s['table']}",
+                "sheet": None,
+                "columns": columns,
+                "sheets": [],
+            })
+            continue
         columns = _describe(s["resolved"], s["sheet"])
         sheets = _list_sheets(s["resolved"])
         # 选完源后，后台预构建缓存（多源模式每个源都要）
@@ -879,6 +1424,7 @@ async def describe_sources(payload: QueryRequest) -> dict:
         ).start()
         result.append({
             "alias": s["alias"],
+            "kind": "file",
             "path": str(s["resolved"]),
             "filename": s["resolved"].name,
             "sheet": s["sheet"],
@@ -936,15 +1482,23 @@ def _run_query_task(task_id: str, sources: list[dict], sql: str, limit: int) -> 
     """
     task = _TASKS[task_id]
     t_start = time.perf_counter()   # 全流程计时起点：含读 Excel / 缓存构建 + SQL 执行
+    has_doris = any(s.get("kind") == "doris" for s in sources)
     con = duckdb.connect()
     tmp_files: list[Path] = []
+    if has_doris:
+        # Doris 源：走进程级共享连接（复用 ATTACH，省掉 ~1.8s 一次性开销）。
+        # 整个查询持 _SHARED_LOCK 串行，避免共享连接上的视图/状态被并发踩踏。
+        _SHARED_LOCK.acquire()
     try:
         # 关闭进度条打印，并让 progress_bar 从 0ms 起算进度（否则前 2s 内
         # query_progress() 返回 -1.0，拿不到真实百分比）
-        con.execute("SET enable_progress_bar = true")
-        con.execute("SET enable_progress_bar_print = false")
-        con.execute("SET progress_bar_time = 0")
-        _load_excel(con)
+        if has_doris:
+            con = _get_shared_con()
+        else:
+            con.execute("SET enable_progress_bar = true")
+            con.execute("SET enable_progress_bar_print = false")
+            con.execute("SET progress_bar_time = 0")
+            _load_excel(con)
 
         # 语句类型决定执行方式：
         #   - SELECT / WITH：注册成临时视图再套 LIMIT（对行注释/块注释/末尾分号都健壮，
@@ -962,9 +1516,10 @@ def _run_query_task(task_id: str, sources: list[dict], sql: str, limit: int) -> 
         # 混合类型（数字列夹杂文本）文件在普通类型扫描下必然报「单元格转换错误」，
         # 首次查询会失败再兜底成全文本并建缓存。若所有 xlsx 源都已存在「全文本语义」
         # 缓存（即此前已判定为混合类型），直接走全文本缓存，跳过注定失败的普通扫描，
-        # 避免每次白读一遍整表。
+        # 避免每次白读一遍整表。数据库源（doris）不参与此判断（无文件）。
         _all_have_varchar_cache = bool(sources) and all(
-            s["resolved"].suffix.lower() == ".csv"
+            s.get("kind") == "doris"
+            or s["resolved"].suffix.lower() == ".csv"
             or _cached_parquet_exists(s["resolved"], s["sheet"], s["alias"], all_varchar=True)
             for s in sources
         )
@@ -1000,11 +1555,20 @@ def _run_query_task(task_id: str, sources: list[dict], sql: str, limit: int) -> 
             poller.start()
 
             try:
+                # doris 源：把用户 SQL 里的别名（表引用位置）展开成三段路径 + AS 别名，
+                # 因为 mysql 扩展视图+聚合有绑定 bug，doris 源不建视图（见 _rewrite_doris_sql）。
+                # 只允许 SELECT/WITH 时重写；元数据语句（describe 等）按原样跑。
+                has_doris = any(s.get("kind") == "doris" for s in sources)
+                exec_sql = _rewrite_doris_sql(sql, sources) if stmt_kind not in ("describe", "show", "summarize", "pragma") else sql
                 if stmt_kind in ("describe", "show", "summarize", "pragma"):
                     # 元数据语句：直接执行（不容忍被装进子查询/视图）
-                    cur = con.execute(sql)
+                    cur = con.execute(exec_sql)
+                elif has_doris:
+                    # Doris 源：直接执行 + 追加 LIMIT（视图包装会把 LIMIT 吃掉导致
+                    # 全表拉取，见 P0 性能诊断；直接执行让 LIMIT/谓词下推到 Doris）。
+                    cur = con.execute(_finalize_doris_sql(exec_sql, limit))
                 else:
-                    con.execute(f"CREATE OR REPLACE VIEW {qtmp} AS {sql}")
+                    con.execute(f"CREATE OR REPLACE VIEW {qtmp} AS {exec_sql}")
                     cur = con.execute(f"SELECT * FROM {qtmp} LIMIT {limit}")
                 columns = [str(d[0]) for d in cur.description]
                 raw_rows = cur.fetchall()
@@ -1057,7 +1621,17 @@ def _run_query_task(task_id: str, sources: list[dict], sql: str, limit: int) -> 
             task["phase"] = "error"
             task["error"] = f"SQL 执行出错: {e}"
     finally:
-        con.close()
+        if has_doris:
+            # 共享连接由应用退出时统一关闭（_close_shared_con），这里只释放锁
+            try:
+                _SHARED_LOCK.release()
+            except Exception:
+                pass
+        else:
+            try:
+                con.close()
+            except Exception:
+                pass
         _cleanup_tmp_files(tmp_files)
 
 
@@ -1230,6 +1804,10 @@ def run_server(host: str = "127.0.0.1", port: int = 8000) -> None:
 def shutdown() -> None:
     """优雅停止由 run_server() 启动的后台服务（桌面窗口关闭时调用）。"""
     global _server_handle
+    # 关闭进程级共享 Doris 连接（ATTACH 复用连接，随应用退出一起释放）
+    _close_shared_con()
+    # 关闭 SQLite 持久化连接
+    _close_store()
     if _server_handle is not None:
         _server_handle.should_exit = True
 

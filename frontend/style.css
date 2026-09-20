@@ -238,8 +238,19 @@ code {
 
 /* ── 紧凑选择文件卡片 ── */
 .pick-card { display: flex; flex-direction: column; gap: 10px; padding: 14px; }
-.pick-line { display: flex; align-items: center; gap: 10px; }
-.pick-line .btn { flex: 1; justify-content: center; }
+.pick-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;               /* 收紧空隙，给两侧图标让位 */
+}
+.pick-line .btn {
+  flex: 1;
+  justify-content: center;
+  min-width: 0;           /* 允许 flex 收缩（否则 gap+固定内容会溢出） */
+  white-space: nowrap;    /* 「选择文件」文字不换行 */
+  overflow: hidden;       /* 极端窄时裁切而非溢出边框 */
+}
+.pick-line .btn.primary svg { flex: 0 0 auto; }   /* 图标不收缩，文字让位 */
 .pick-card .file-info { margin-top: 0; }
 .pick-card .status-msg { margin-top: 0; }
 
@@ -290,9 +301,12 @@ code {
 .source-item.active .src-index { background: var(--accent); color: #fff; }
 
 .alias-input {
-  width: 84px;              /* 别名框加宽：容纳稍长的语义化别名（sales_2024 等） */
-  min-width: 0;
-  flex: 0 0 auto;
+  /* 方案 A：别名框改为弹性收缩（flex: 1 1 auto），窄栏时自动压缩给两侧
+     图标按钮让位，杜绝「选择/删除」被挤出卡外；min-width 兜底别名可读性。 */
+  flex: 1 1 auto;
+  min-width: 44px;
+  width: auto;
+  max-width: 96px;          /* 上限微降补偿弹性：别名仍居中，避免撑满卡头 */
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 4px 6px;
@@ -381,6 +395,96 @@ code {
   cursor: pointer;
 }
 .source-item .src-sheet:focus { outline: none; border-color: var(--text); }
+
+/* ── 多源添加按钮行（文件 + 连接 Doris，图标化）── */
+.src-add-row { display: flex; gap: 7px; margin-top: 2px; }
+.src-add-row .btn { flex: 1; justify-content: center; font-size: 12.5px; padding: 7px; }
+.src-add-row .btn.icon-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 7px 0;              /* 靠图标垂直居中，仅左右留白 */
+  height: 32px;
+  width: 32px;
+  color: var(--muted);
+}
+.src-add-row .btn.icon-btn svg { display: block; }
+.src-add-row .btn.icon-btn:hover { color: var(--text); }
+
+/* ── 数据库连接浮层 ── */
+.db-conn-pop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;                 /* 高于最近打开浮层 */
+  display: grid;
+  place-items: center;
+  background: rgba(22, 24, 29, 0.28);
+}
+.db-conn-pop.hidden { display: none; }
+.db-conn-modal {
+  width: 420px;
+  max-width: calc(100vw - 40px);
+  background: var(--card);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(22, 24, 29, 0.16);
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 80px);
+}
+.db-conn-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.db-conn-title { font-size: 14px; font-weight: 600; }
+.db-conn-close {
+  border: none; background: transparent; color: var(--muted-2);
+  font-size: 20px; line-height: 1; cursor: pointer; padding: 2px 6px;
+}
+.db-conn-close:hover { color: var(--text); }
+.db-conn-body {
+  padding: 14px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+}
+.db-conn-field { display: flex; flex-direction: column; gap: 4px; }
+.db-conn-field > span {
+  font-size: 11px; color: var(--muted);
+  letter-spacing: 0.02em;
+}
+.db-conn-field input,
+.db-conn-field select {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  padding: 7px 9px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  width: 100%;
+}
+.db-conn-field input:focus,
+.db-conn-field select:focus { outline: none; border-color: var(--text); }
+.db-conn-row { display: flex; gap: 10px; }
+.db-conn-row .grow { flex: 1; min-width: 0; }
+.db-conn-row .port { width: 90px; flex: 0 0 auto; }
+.db-conn-remember {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 12px; color: var(--muted);
+}
+.db-conn-status { font-size: 12px; min-height: 18px; }
+.db-conn-status.ok { color: var(--ok); }
+.db-conn-status.error { color: var(--danger); }
+.db-conn-actions { display: flex; justify-content: flex-end; }
+.db-conn-actions .btn { margin-top: 2px; }
+#dbConnStep2 { display: flex; flex-direction: column; gap: 10px; }
+#dbConnStep2.hidden { display: none; }
 
 /* ── 文件浏览器 ── */
 .browser { display: flex; flex-direction: column; gap: 9px; }
@@ -502,6 +606,28 @@ code {
   box-shadow: 0 0 0 3px rgba(22, 24, 29, 0.08);
 }
 .field-search::placeholder { color: var(--muted-2); }
+/* Doris 连接级源：字段区顶部的库/表切换下拉 */
+.doris-picker {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.doris-picker select {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 7px 8px;
+  border-radius: 6px;
+}
+.doris-picker select:focus {
+  outline: none;
+  border-color: var(--text);
+  box-shadow: 0 0 0 3px rgba(22, 24, 29, 0.08);
+}
 /* 字段区：唯一滚动容器，占满字段卡片剩余高度 */
 #fieldsBox {
   display: flex;
@@ -523,10 +649,35 @@ code {
   padding: 4px 9px;
   cursor: pointer;
   transition: border-color .14s, background .14s;
+  display: inline-flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  column-gap: 0;
+  row-gap: 2px;
+  max-width: 100%;
 }
 .field-chip:hover { border-color: var(--text); background: var(--bg-soft); }
+.field-chip .fkey {
+  margin-right: 4px;
+  font-size: 11px;
+  line-height: 1;
+}
+.field-chip .fname {
+  color: var(--text);
+}
 .field-chip .ftype { color: var(--muted-2); margin-left: 7px; font-size: 11px; }
 .field-chip:hover .ftype { color: var(--muted); }
+.field-chip .fcomment {
+  flex-basis: 100%;
+  color: var(--muted-2);
+  font-size: 11px;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.field-chip:hover .fcomment { color: var(--muted); }
 .placeholder { color: var(--muted-2); font-size: 13px; margin: 4px 0; }
 
 /* ── SQL ── */
@@ -1152,15 +1303,19 @@ tbody tr:hover { background: var(--bg-tint); }
 /* ── 最近打开（历史文件）：按钮 + 浮层 ── */
 /* 触发按钮：在左栏 pick-card 内，占一行，不撑高布局 */
 .recent-btn {
-  display: flex;
+  position: relative;           /* 供数量角标绝对定位 */
+  flex: 0 0 auto;               /* 与「+ 文件」「+ Doris」同行时不拉伸 */
+  display: inline-flex;
   align-items: center;
-  gap: 6px;
-  width: 100%;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  margin-top: 0;
   border: 1px solid var(--border);
   background: var(--card);
   color: var(--muted);
   font-size: 12px;
-  padding: 6px 9px;
   border-radius: 6px;
   cursor: pointer;
   transition: border-color .14s, color .14s, background .14s;
@@ -1170,32 +1325,145 @@ tbody tr:hover { background: var(--bg-tint); }
   color: var(--text);
   background: var(--bg-soft);
 }
-.recent-btn .recent-count { color: var(--muted-2); }
+.recent-btn svg { display: block; }
+.recent-btn .recent-count {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 3px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 9.5px;
+  font-weight: 600;
+  line-height: 1;
+  pointer-events: none;
+}
 .recent-btn.hidden { display: none; }
 
-/* 浮层：body 直接子级，fixed 定位 + JS 计算坐标（避开 .card 的
-   overflow:hidden 裁剪与 transform 破坏 fixed） */
+/* 通用确认弹框：替代 window.confirm（原生对话框显示 URL 且深色系统样式） */
+.confirm-pop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;                /* 高于最近打开弹框 */
+  display: grid;
+  place-items: center;
+  background: rgba(22, 24, 29, 0.32);
+}
+.confirm-pop.hidden { display: none; }
+.confirm-modal {
+  width: 320px;
+  max-width: calc(100vw - 40px);
+  background: var(--card);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(22, 24, 29, 0.16);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.confirm-msg {
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.55;
+  white-space: pre-line;       /* 保留换行 */
+  word-break: break-word;
+}
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.confirm-actions .btn { padding: 7px 14px; font-size: 12.5px; }
+
+/* 保存组合对话框：重命名 / 保存当前组合 / 另存为 */
+#saveComboPop { z-index: 115; }   /* 复用 .recent-pop 遮罩/居中；略高于最近打开，确保置顶 */
+.save-combo-modal { width: 340px; }
+.save-combo-field { display: flex; flex-direction: column; gap: 4px; }
+.save-combo-field > span {
+  font-size: 11px; color: var(--muted);
+  letter-spacing: 0.02em;
+}
+.save-combo-field input {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  padding: 7px 9px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text);
+  width: 100%;
+}
+.save-combo-field input:focus { outline: none; border-color: var(--text); }
+.save-combo-tip {
+  font-size: 11.5px;
+  color: var(--muted-2);
+  line-height: 1.5;
+}
+.save-combo-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
+}
+.save-combo-actions .btn { padding: 7px 14px; font-size: 12.5px; }
+
+/* 最近打开弹框：居中模态（遮罩 + 卡片），统一管理最近组合 + 最近文件 */
 .recent-pop {
   position: fixed;
-  z-index: 200;
-  width: 300px;
-  max-height: 70vh;
+  inset: 0;
+  z-index: 90;                 /* 略高于内容，低于 dbConnPop(80→已调) */
+  display: grid;
+  place-items: center;
+  background: rgba(22, 24, 29, 0.28);
+}
+.recent-pop.hidden { display: none; }
+.recent-modal {
+  width: 360px;
+  max-width: calc(100vw - 40px);
+  max-height: calc(100vh - 80px);
   display: flex;
   flex-direction: column;
   background: var(--card);
   border: 1px solid var(--border-strong);
-  border-radius: 8px;
-  box-shadow: 0 6px 24px rgba(22, 24, 29, 0.12);
-  padding: 10px;
-  gap: 6px;
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(22, 24, 29, 0.16);
 }
-.recent-pop.hidden { display: none; }
+.recent-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.recent-pop-close {
+  border: none; background: transparent; color: var(--muted-2);
+  font-size: 20px; line-height: 1; cursor: pointer; padding: 2px 6px;
+}
+.recent-pop-close:hover { color: var(--text); }
+.recent-modal-body {
+  padding: 12px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+}
 .recent-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
 }
 .recent-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.recent-subtitle {
   font-size: 11.5px;
   font-weight: 600;
   color: var(--muted);
@@ -1316,6 +1584,13 @@ tbody tr:hover { background: var(--bg-tint); }
   white-space: nowrap;
   color: var(--text);
   font-family: var(--mono);
+}
+.recent-combo-name b { font-weight: 600; color: var(--text); }
+.recent-combo-label {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--muted-2);
+  margin-left: 4px;
 }
 
 /* 缺失文件：条目标红 + 「清除缺失」按钮 */

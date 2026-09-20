@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>EXCEL → SQL 查询台</title>
   <link rel="stylesheet" href="./codemirror.css?v=1">
-  <link rel="stylesheet" href="./style.css?v=25">
+  <link rel="stylesheet" href="./style.css?v=38">
 </head>
 <body>
   <div class="vg-glow" aria-hidden="true"></div>
@@ -68,17 +68,29 @@
         <!-- 多源关联模式 -->
         <div id="multiModeBox" class="hidden">
           <div id="sourceList" class="source-list"></div>
-          <button id="addSourceBtn" class="btn" type="button">+ 添加数据源</button>
+          <div class="src-add-row">
+            <button id="addSourceBtn" class="btn icon-btn" type="button" title="添加文件数据源">
+              <svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M1.5 4.5A1.5 1.5 0 0 1 3 3h2.2l1.4 1.8h4.4A1.5 1.5 0 0 1 12.5 6.3V10a1.5 1.5 0 0 1-1.5 1.5H3A1.5 1.5 0 0 1 1.5 10z"/></svg>
+            </button>
+            <button id="addDbBtn" class="btn icon-btn" type="button" title="连接 Doris 数据库">
+              <svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><ellipse cx="7" cy="3.5" rx="5" ry="2"/><path d="M2 3.5v7c0 1.1 2.24 2 5 2s5-.9 5-2v-7"/><path d="M2 7c0 1.1 2.24 2 5 2s5-.9 5-2"/></svg>
+            </button>
+          </div>
         </div>
+
+        <!-- 主动保存 + 最近打开：图标按钮（单文件 + 多源共用，随模式移动位置） -->
+        <button id="saveBtn" class="recent-btn" type="button" title="保存当前组合 / 文件到最近打开">
+          <svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M3 1.5h6l2 2v9H3z M3 1.5v4h6v-4 M5.5 8.5a1.5 1.5 0 1 0 3 0 1.5 1.5 0 0 0-3 0z"/></svg>
+        </button>
+        <button id="recentBtn" class="recent-btn hidden" type="button" title="查看最近打开的文件">
+          <svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+            <path d="M7 1.5a5.5 5.5 0 1 0 5.3 4M7 1.5V4m0-2.5h2.5M10.6 1.8 12.3 4l-1.7 2.2"/>
+          </svg>
+          <span id="recentCount" class="recent-count"></span>
+        </button>
 
         <div id="uploadStatus" class="status-msg"></div>
         <div id="openStages" class="open-stages"></div>
-        <button id="recentBtn" class="recent-btn hidden" type="button" title="查看最近打开的文件">
-          <svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
-            <path d="M7 1.5a5.5 5.5 0 1 0 5.3 4M7 1.5V4m0-2.5h2.5M10.6 1.8 12.3 4l-1.7 2.2"/>
-          </svg>
-          最近打开 <span id="recentCount" class="recent-count"></span>
-        </button>
       </section>
 
       <section class="card step" id="fieldsCard">
@@ -86,6 +98,11 @@
           <div class="step-title">
             <h2>数据字段 <span id="sourceLabel" class="muted"></span></h2>
           </div>
+        </div>
+        <!-- Doris 连接级源：库/表切换（仅选中 doris 源且已拉到清单时显示） -->
+        <div id="dorisPicker" class="doris-picker hidden">
+          <select id="dorisDbSelect" class="doris-db-select" title="选择库"></select>
+          <select id="dorisTableSelect" class="doris-table-select" title="选择表"></select>
         </div>
         <input id="fieldSearch" class="field-search" type="text"
           placeholder="搜索字段…" spellcheck="false" autocomplete="off">
@@ -124,15 +141,111 @@
   <!-- 大纲浮轨：置于 body 直接子级，避免 .card.step 的 transform 动画使其 fixed 定位失效 -->
   <div id="cellOutline" class="cell-outline" aria-hidden="false"></div>
 
-  <!-- 最近打开浮层：body 直接子级（.card 的 overflow:hidden 会裁剪它），
-       fixed 定位 + JS 计算位置，避开 .card.step 的 transform 破坏 fixed -->
-  <div id="recentPop" class="recent-pop hidden"></div>
+  <!-- 通用确认弹框：替代 window.confirm（原生对话框会显示 URL 且深色系统样式，与界面割裂） -->
+  <div id="confirmPop" class="confirm-pop hidden">
+    <div class="confirm-modal">
+      <div class="confirm-msg" id="confirmMsg"></div>
+      <div class="confirm-actions">
+        <button id="confirmCancel" class="btn" type="button">取消</button>
+        <button id="confirmOk" class="btn primary" type="button">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 保存对话框：保存当前组合/文件 / 另存为 / 修改名称（多源=组合，单源=文件） -->
+  <div id="saveComboPop" class="recent-pop hidden">
+    <div class="recent-modal save-combo-modal">
+      <div class="recent-modal-head">
+        <span class="recent-title" id="saveComboTitle">保存组合</span>
+        <button id="saveComboClose" class="recent-pop-close" type="button" title="关闭">&times;</button>
+      </div>
+      <div class="recent-modal-body">
+        <label class="save-combo-field">
+          <span id="saveComboNameLabel">组合名称</span>
+          <input id="saveComboNameInput" type="text" placeholder="如：月度收入汇总" autocomplete="off" spellcheck="false">
+        </label>
+        <div id="saveComboTip" class="save-combo-tip"></div>
+        <div class="save-combo-actions">
+          <button id="saveComboCurrent" class="btn primary" type="button">保存当前组合</button>
+          <button id="saveComboAs" class="btn" type="button">另存为</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 最近打开弹框：居中模态，统一管理最近组合 + 最近文件 -->
+  <div id="recentPop" class="recent-pop hidden">
+    <div class="recent-modal">
+      <div class="recent-modal-head">
+        <span class="recent-title">最近打开</span>
+        <button id="recentPopClose" class="recent-pop-close" type="button" title="关闭">&times;</button>
+      </div>
+      <div class="recent-modal-body" id="recentPopBody"></div>
+    </div>
+  </div>
+
+  <!-- 数据库连接浮层：body 直接子级，fixed 定位，测试连接 + 选择库表 -->
+  <div id="dbConnPop" class="db-conn-pop hidden">
+    <div class="db-conn-modal">
+      <div class="db-conn-head">
+        <span class="db-conn-title">连接 Doris 数据库</span>
+        <button id="dbConnClose" class="db-conn-close" type="button" title="关闭">&times;</button>
+      </div>
+      <div class="db-conn-body">
+        <label class="db-conn-field" id="dbConnSavedField">
+          <span>已保存的连接</span>
+          <select id="dbConnSaved">
+            <option value="">（选择历史连接自动填充）</option>
+          </select>
+        </label>
+        <label class="db-conn-field">
+          <span>连接名（可选）</span>
+          <input id="dbConnName" type="text" placeholder="如：财务 Doris" autocomplete="off">
+        </label>
+        <div class="db-conn-row">
+          <label class="db-conn-field grow">
+            <span>主机</span>
+            <input id="dbConnHost" type="text" placeholder="finance.kdp.newbelle.com.cn" autocomplete="off">
+          </label>
+          <label class="db-conn-field port">
+            <span>端口</span>
+            <input id="dbConnPort" type="number" value="9030" min="1" max="65535">
+          </label>
+        </div>
+        <div class="db-conn-row">
+          <label class="db-conn-field grow">
+            <span>用户名</span>
+            <input id="dbConnUser" type="text" placeholder="root" autocomplete="off">
+          </label>
+          <label class="db-conn-field grow">
+            <span>密码</span>
+            <input id="dbConnPass" type="password" placeholder="（可选）" autocomplete="off">
+          </label>
+        </div>
+        <label class="db-conn-remember">
+          <input id="dbConnRemember" type="checkbox" checked>
+          <span>记住连接（下次免填；密码保存在本机）</span>
+        </label>
+        <div id="dbConnStatus" class="db-conn-status"></div>
+        <div class="db-conn-actions">
+          <button id="dbConnTest" class="btn" type="button">测试连接</button>
+        </div>
+        <div id="dbConnStep2" class="hidden">
+          <label class="db-conn-field">
+            <span>选择数据表（可选，稍后可在字段区切换库表）</span>
+            <select id="dbTableSelect"></select>
+          </label>
+          <button id="dbConnAdd" class="btn primary" type="button">添加连接</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <script src="./codemirror.js?v=1"></script>
   <script src="./mode/sql/sql.js?v=1"></script>
   <script src="./addon/comment/comment.js?v=1"></script>
   <script src="./addon/hint/show-hint.js?v=1"></script>
   <script src="./addon/hint/sql-hint.js?v=1"></script>
-  <script src="./app.js?v=39"></script>
+  <script src="./app.js?v=54"></script>
 </body>
 </html>
