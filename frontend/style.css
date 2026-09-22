@@ -1658,6 +1658,19 @@ li.CodeMirror-hint-active {
   color: #fff;
 }
 
+/* ── 行号列（结果表最左列，与数据列视觉区分）── */
+.row-index-head,
+.row-index-cell {
+  min-width: 44px;
+  max-width: 44px;
+  width: 44px;
+  text-align: right;
+  color: var(--muted-2);
+  background: var(--bg-soft);
+  user-select: none;
+}
+.row-index-cell { font-family: var(--mono); font-size: 11.5px; }
+
 /* ── 虚拟滚动结果表格 ── */
 /* 行数超过阈值时，结果区从「随内容展开」切换为固定高度的独立滚动容器，
    只渲染可视窗口内的行，保证万行结果不卡顿。 */
@@ -1682,7 +1695,7 @@ li.CodeMirror-hint-active {
 }
 
 /* ── 底部合计行 ── */
-/* 表格末行的合计：数字列 SUM、非数字列「—」、首格「合计」标签。
+/* 表格末行的合计：数字列 SUM、非数字列「—」；「合计」标签与表头「#」同列。
    结果区可滚动（虚拟滚动或表格超高）时吸附在可视区底部，滚到
    任意位置都能看到合计；表短时就是普通末行。 */
 tfoot tr.totals-row {
@@ -1696,6 +1709,7 @@ tfoot tr.totals-row td {
   font-weight: 600;
   color: var(--text);
 }
-tfoot tr.totals-row td.totals-label {
-  color: var(--muted);
+tfoot tr.totals-row td.row-index-cell {
+  color: var(--muted);      /* 覆盖外层 td 的深色，标签保持低调 */
+  text-align: right;
 }

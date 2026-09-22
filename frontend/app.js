@@ -2583,22 +2583,30 @@
     return DECIMAL_RE.test(s) ? Number(s) : NaN;
   }
 
-  // 计算各列合计：某列至少有一个可转数字的值时返回其 SUM（非数字单元格
-  // 忽略不计，与 Excel SUM 行为一致，容忍一列里混个别文本/空值）；
-  // 一列完全没有数字时返回 null。只统计当前已返回的行。
+  // 计算各列合计：某列「非空单元格中数字占比 ≥ 60%」时才视为数字列并返回其 SUM。
+  // 收紧识别：备注/编号等文本列里偶尔混几个数字（"金额1、金额2"）不再被误当成
+  // 可求和列；纯数字列（即便有空值）正常求和。非数字单元格忽略不计。
+  // 只统计当前已返回的行，全部不是数字时返回 null。
+  const TOTAL_NUM_RATIO = 0.6;
   function computeColumnTotals(cols, rows) {
     if (!rows.length) return null;
     const sums = new Array(cols.length).fill(null);
     for (let ci = 0; ci < cols.length; ci++) {
       let sum = 0;
       let any = false;
+      let nonEmpty = 0;
+      let numeric = 0;
       for (let i = 0; i < rows.length; i++) {
-        const n = toNumber(rows[i][cols[ci]]);
-        if (Number.isNaN(n)) continue;   // 空值/文本：跳过，不影响求和
+        const v = rows[i][cols[ci]];
+        if (v === null || v === undefined || v === "") continue;
+        nonEmpty++;
+        const n = toNumber(v);
+        if (Number.isNaN(n)) continue;   // 文本：跳过，不影响求和
         sum += n;
         any = true;
+        numeric++;
       }
-      if (any) sums[ci] = sum;
+      if (any && numeric / nonEmpty >= TOTAL_NUM_RATIO) sums[ci] = sum;
     }
     return sums;
   }
@@ -2610,12 +2618,17 @@
     return String(parseFloat(v.toFixed(10)));
   }
 
-  // 构建完整 table（表头 + from..to 之间数据行 + 底部合计行）；
+  // 构建完整 table（行号列 + 表头 + from..to 之间数据行 + 底部合计行）；
   // to<=from 时只建空 tbody（虚拟滚动模式由 paint() 填充）。
   function buildFullTable(cols, rows, from, to) {
     const table = document.createElement("table");
     const thead = document.createElement("thead");
     const trHead = document.createElement("tr");
+    // 行号列：固定表头「#」，不参与列数据
+    const thIdx = document.createElement("th");
+    thIdx.className = "row-index-head";
+    thIdx.textContent = "#";
+    trHead.appendChild(thIdx);
     cols.forEach((c) => {
       const th = document.createElement("th");
       th.textContent = c;
@@ -2626,26 +2639,25 @@
 
     const tbody = document.createElement("tbody");
     for (let i = from; i < to; i++) {
-      tbody.appendChild(buildRow(cols, rows[i]));
+      tbody.appendChild(buildRow(cols, rows[i], i));
     }
     table.appendChild(tbody);
 
-    // 合计行：纯数字列显示 SUM，首列单元格放「合计」标签（首列也是数字列时
-    // 显示「合计 <sum>」；其余非数字列显示「—」）。无数据时不输出合计行。
+    // 合计行：「合计」标签放在最左的序号列那一格；数据列统一按
+    // 「数字列显示 SUM、非数字列显示 —」。无数据时不输出合计行。
     const totals = computeColumnTotals(cols, rows);
     if (totals) {
       const tfoot = document.createElement("tfoot");
       const tr = document.createElement("tr");
       tr.className = "totals-row";
+      // 序号列位置：放「合计」标签（与表头「#」对齐）
+      const thIdxF = document.createElement("td");
+      thIdxF.className = "row-index-cell";
+      thIdxF.textContent = "合计";
+      tr.appendChild(thIdxF);
       cols.forEach((c, ci) => {
         const td = document.createElement("td");
-        if (ci === 0) {
-          td.textContent =
-            totals[0] !== null ? `合计 ${formatTotal(totals[0])}` : "合计";
-          td.className = "totals-label";
-        } else {
-          td.textContent = totals[ci] !== null ? formatTotal(totals[ci]) : "—";
-        }
+        td.textContent = totals[ci] !== null ? formatTotal(totals[ci]) : "—";
         tr.appendChild(td);
       });
       tfoot.appendChild(tr);
@@ -2654,8 +2666,17 @@
     return table;
   }
 
-  function buildRow(cols, r) {
+  // 行号列单元格：灰底、右对齐、等宽、窄列
+  function buildRowIndexCell(i) {
+    const td = document.createElement("td");
+    td.className = "row-index-cell";
+    td.textContent = String(i + 1);
+    return td;
+  }
+
+  function buildRow(cols, r, i) {
     const tr = document.createElement("tr");
+    if (typeof i === "number") tr.appendChild(buildRowIndexCell(i));
     cols.forEach((c) => {
       const td = document.createElement("td");
       const v = r[c];
@@ -2665,12 +2686,12 @@
     return tr;
   }
 
-  // 在 tbody 里放一个整行高为 px 的空行，用于撑出滚动高度
+  // 在 tbody 里放一个整行高为 px 的空行，用于撑出滚动高度（含行号占位）
   function buildSpacerRow(cols, px) {
     const tr = document.createElement("tr");
     tr.className = "vscroll-spacer-row";
     const td = document.createElement("td");
-    td.colSpan = cols.length;
+    td.colSpan = cols.length + 1;   // +1 行号列
     td.style.height = px + "px";
     td.style.padding = "0";
     td.style.border = "none";
@@ -2695,7 +2716,7 @@
       // 重建 tbody：顶部 spacer + 数据行 + 底部 spacer
       const frag = document.createDocumentFragment();
       if (first > 0) frag.appendChild(buildSpacerRow(cols, first * VSCROLL_ROW_PX));
-      for (let i = first; i < last; i++) frag.appendChild(buildRow(cols, rows[i]));
+      for (let i = first; i < last; i++) frag.appendChild(buildRow(cols, rows[i], i));
       if (last < total) frag.appendChild(buildSpacerRow(cols, (total - last) * VSCROLL_ROW_PX));
       tbody.innerHTML = "";
       tbody.appendChild(frag);
