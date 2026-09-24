@@ -598,6 +598,60 @@
       });
       box.appendChild(pickLocal);
     }
+
+    // 全局弹框底部：查询缓存管理（显示占用 + 清空入口）
+    if (!recentTargetSrc) {
+      const cacheRow = document.createElement("div");
+      cacheRow.className = "recent-cache-row";
+      const cacheInfo = document.createElement("span");
+      cacheInfo.className = "recent-cache-info";
+      cacheInfo.textContent = "查询缓存…";
+      const cacheClear = document.createElement("button");
+      cacheClear.type = "button";
+      cacheClear.className = "recent-cache-clear";
+      cacheClear.textContent = "清除缓存";
+      cacheClear.title = "删除已生成的 parquet 查询缓存（下次查询自动重建）";
+      cacheClear.addEventListener("click", (e) => {
+        e.stopPropagation();
+        showConfirm("确定清空全部查询缓存吗？\n下次查询时会自动重新生成。", async () => {
+          try {
+            const r = await request("/api/cache/clear", {});
+            showStatus(uploadStatus, `已清除 ${r.removed} 个缓存文件`, "ok");
+            refreshCacheInfo(cacheInfo);
+          } catch (err) {
+            showStatus(uploadStatus, popError(err), "error");
+          }
+        });
+      });
+      cacheRow.appendChild(cacheInfo);
+      cacheRow.appendChild(cacheClear);
+      box.appendChild(cacheRow);
+      refreshCacheInfo(cacheInfo);   // 异步拉取缓存占用
+    }
+  }
+
+  // 刷新缓存占用信息到指定元素
+  async function refreshCacheInfo(el) {
+    if (!el) return;
+    try {
+      const r = await request("/api/cache/info", {});
+      el.textContent = (r && r.count)
+        ? `查询缓存：${r.count} 个文件 · ${fmtBytes(r.size_bytes)}`
+        : "查询缓存：无";
+      el.title = r && r.dir ? `缓存目录：${r.dir}` : "";
+    } catch (_) {
+      el.textContent = "查询缓存：—";
+    }
+  }
+
+  // 字节数人性化：B / KB / MB / GB
+  function fmtBytes(n) {
+    if (!Number.isFinite(n) || n <= 0) return "0 B";
+    const units = ["B", "KB", "MB", "GB"];
+    let v = n;
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (v >= 10 || i === 0 ? v.toFixed(0) : v.toFixed(1)) + " " + units[i];
   }
 
   // 恢复一个多源组合：清空当前 sources，按其快照逐个重建（只写状态，不加载字段，
@@ -1127,6 +1181,16 @@
       return parts.length ? parts.join("；") : "请求参数错误";
     }
     return d || err?.message || String(err || "未知错误");
+  }
+
+  // 展示错误信息到 cell 状态（主文本 + title 悬浮存原始详情）
+  function showCellError(cell, err) {
+    if (!cell || !cell.dom) return;
+    const text = popError(err);
+    cell.dom.status.textContent = text;
+    cell.dom.status.className = "cell-status error";
+    // 完整信息（可能是多行翻译）放进 title，悬浮可见
+    cell.dom.status.title = text;
   }
 
   async function request(path, body) {
@@ -2094,7 +2158,12 @@
     runBtn.type = "button";
     runBtn.className = "cell-run";
     runBtn.textContent = "▶ 运行";
-    runBtn.addEventListener("click", () => runCell(cell.id));
+    runBtn.title = "运行查询（Ctrl+Enter）";
+    // 运行中点击 = 取消当前查询；空闲点击 = 运行
+    runBtn.addEventListener("click", () => {
+      if (cell._running) cancelCellQuery(cell.id);
+      else runCell(cell.id);
+    });
 
     const status = document.createElement("span");
     status.className = "cell-status";
@@ -2421,6 +2490,7 @@
     const cell = getCell(id);
     if (!cell) return;
     const { cm, status, runBtn, progress } = cell.dom;
+    if (cell._running) return;   // 运行中：忽略重复触发（按钮/Ctrl+Enter）
 
     const payloadSources = buildSourcesPayload();
     if (!payloadSources.length) {
@@ -2457,6 +2527,14 @@
     runBtn.disabled = true;
     startPrepare(cell);         // 开始爬升准备进度条
 
+    cell._running = true;
+    cell._taskId = null;
+    // 运行中按钮变为「取消」（原黑色运行按钮换成描边样式）
+    runBtn.textContent = "✕ 取消";
+    runBtn.title = "取消当前查询";
+    runBtn.classList.add("cell-run-cancel");
+    runBtn.disabled = false;
+
     try {
       // per-cell 行数限制：运行时快照，避免运行期间被其他操作改动干扰
       const limit = cell.limit ?? DEFAULT_LIMIT;
@@ -2467,10 +2545,13 @@
         limit: Number.isFinite(limit) && limit > 0 ? limit : DEFAULT_LIMIT,
       });
       const taskId = submit.task_id;
+      cell._taskId = taskId;
 
       // 2) 轮询进度，直到 done / error（自适应退避：准备阶段慢轮询，运行阶段适度加快）
       let data = null;
       let pollDelay = 80;
+      let timedOut = false;
+      let cancelled = false;
       for (;;) {
         const p = await request("/api/progress", { task_id: taskId });
         if (p.phase === "run") {
@@ -2492,12 +2573,32 @@
         if (p.status === "error") {
           throw new Error(p.error || "查询执行出错");
         }
+        if (p.status === "cancelled") {
+          cancelled = true;
+          break;
+        }
+        if (p.status === "timeout") {
+          timedOut = true;
+          break;
+        }
         await new Promise((r) => setTimeout(r, pollDelay));
         // 线性退避到 500ms 上限之后不再增长，避免进度条更新显得迟滞
         pollDelay = Math.min(500, pollDelay + 40);
       }
 
+      if (cancelled) {
+        status.textContent = "已取消查询";
+        status.className = "cell-status";
+        return;
+      }
+      if (timedOut) {
+        status.textContent = "查询超过时限，已自动中止";
+        status.className = "cell-status error";
+        return;
+      }
+
       cell.lastResult = data;
+      cell._lastTaskId = taskId;   // 供「按 task_id 导出」直读后端缓存（大结果集不回传前端）
       expandCell(cell.id);     // 先展开（解除 body 的 display:none），虚拟滚动才能测到容器高度
       renderCellResult(cell, data);
       // 结果完成后滚动右侧卡片（唯一纵向滚动容器）让结果区顶部对齐可视区，
@@ -2527,16 +2628,45 @@
       status.className = "cell-status ok";
       setRealProgress(cell, 100);
     } catch (e) {
-      status.textContent = popError(e);
-      status.className = "cell-status error";
+      showCellError(cell, e);
     } finally {
+      // 恢复「运行」按钮状态
+      cell._running = false;
+      cell._taskId = null;
+      runBtn.classList.remove("cell-run-cancel");
+      runBtn.textContent = "▶ 运行";
+      runBtn.title = "运行查询（Ctrl+Enter）";
       runBtn.disabled = false;
       stopPrepare(cell);
-      // 完成/出错后再显示一小段时间后隐藏进度条
+      // 完成/出错/取消后再显示一小段时间后隐藏进度条
       setTimeout(() => {
         if (progress) progress.classList.add("hidden");
       }, 350);
     }
+  }
+
+  // 取消一个正在运行的 cell 查询：通知后端置 cancelled（后台线程会 interrupt() 终止）
+  async function cancelCellQuery(id) {
+    const cell = getCell(id);
+    if (!cell || !cell._running || !cell._taskId) return;
+    const taskId = cell._taskId;
+    cell._taskId = null;   // 防重复点击
+    try {
+      await request("/api/cancel", { task_id: taskId });
+    } catch (_) { /* 后端已结束/不可达：无需处理，轮询会收尾 */ }
+    // 轮询循环下一次 /api/progress 会拿到 cancelled 状态并收尾；若请求失败
+    // （任务已被惰性清理），这里兜底把 UI 复位
+    setTimeout(() => {
+      if (cell._running && !cell._taskId) {
+        cell._running = false;
+        cell.dom.runBtn.classList.remove("cell-run-cancel");
+        cell.dom.runBtn.textContent = "▶ 运行";
+        cell.dom.runBtn.title = "运行查询（Ctrl+Enter）";
+        cell.dom.runBtn.disabled = false;
+        cell.dom.status.textContent = "已取消查询";
+        cell.dom.status.className = "cell-status";
+      }
+    }, 1500);
   }
 
   // 结果表虚拟滚动：行数超过阈值时只渲染可视区的行，避免 1 万行 DOM 卡顿。
@@ -2550,6 +2680,7 @@
   function renderCellResult(cell, data) {
     const cols = data.columns || [];
     const rows = data.rows || [];
+    const columnTypes = data.column_types || null;
     const { result, resultWrap, rowCount } = cell.dom;
 
     // 清空旧结果，重建表格
@@ -2561,9 +2692,9 @@
     const virtual = rows.length > VSCROLL_THRESHOLD;
     resultWrap.classList.toggle("vscroll", virtual);
     if (virtual) {
-      renderVirtualTable(cell, cols, rows);
+      renderVirtualTable(cell, cols, rows, columnTypes);
     } else {
-      resultWrap.appendChild(buildFullTable(cols, rows, 0, rows.length));
+      resultWrap.appendChild(buildFullTable(cols, rows, 0, rows.length, columnTypes));
     }
 
     const effectiveLimit = data.limit;
@@ -2583,30 +2714,67 @@
     return DECIMAL_RE.test(s) ? Number(s) : NaN;
   }
 
-  // 计算各列合计：某列「非空单元格中数字占比 ≥ 60%」时才视为数字列并返回其 SUM。
-  // 收紧识别：备注/编号等文本列里偶尔混几个数字（"金额1、金额2"）不再被误当成
-  // 可求和列；纯数字列（即便有空值）正常求和。非数字单元格忽略不计。
-  // 只统计当前已返回的行，全部不是数字时返回 null。
+  // 计算各列合计：用「列名黑名单 → 类型白名单 → 数字占比启发式」三层判定，
+  // 避免把状态、日期、编号等列误当成数值求和。
+  //
+  // 判定顺序（任一命中即生效）：
+  //   1. 列名匹配黑名单关键词（状态/日期/时间/类型/编号/序号/id 等）→ 不求和
+  //   2. 类型明确是数值（int/decimal/float/double…）→ 求和
+  //   3. 类型是日期时间 → 不求和
+  //   4. 类型缺失或文本 → 回退「非空值中数字占比 ≥ 60%」启发式（兼容全文本读出的金额列）
   const TOTAL_NUM_RATIO = 0.6;
-  function computeColumnTotals(cols, rows) {
+  // 列名黑名单关键词（小写匹配；命中即视为语义列，不求和）
+  const TOTAL_NAME_BLACKLIST = /state|status|type|kind|code|no\b|id\b|date|time|year|month|week|flag|bool|是否|状态|类型|编号|序号|日期|时间|年|月|周|编码|等级|级别|标志/;
+  // 数值类型白名单（DuckDB 类型名；DECIMAL(p,s) 与 INT 系的别名都含在内）
+  const NUMERIC_TYPE_RE = /^(decimal|dec|numeric|tinyint|smallint|integer|int|bigint|hugeint|utinyint|usmallint|uinteger|ubigint|uhugeint|float|real|double)/;
+  // 日期时间类型（硬排除）
+  const TEMPORAL_TYPE_RE = /^(date|datetime|timestamp|time|interval)/;
+  // 布尔类型（硬排除：0/1 全是数字，落到启发式会被误求和）
+  const BOOLEAN_TYPE_RE = /^bool/;
+
+  function isNumericColumn(col, type) {
+    // 1) 列名黑名单
+    if (TOTAL_NAME_BLACKLIST.test(String(col).toLowerCase())) return false;
+    if (!type) return null;   // 无类型信息 → 交给启发式
+    const t = String(type).toLowerCase().trim();
+    // 2) 日期时间 / 布尔 → 明确不求和
+    if (TEMPORAL_TYPE_RE.test(t) || BOOLEAN_TYPE_RE.test(t)) return false;
+    // 3) 数值类型白名单 → 求和
+    if (NUMERIC_TYPE_RE.test(t)) return true;
+    // 4) 其余（varchar/text 等）→ 启发式
+    return null;
+  }
+
+  function computeColumnTotals(cols, rows, columnTypes) {
     if (!rows.length) return null;
     const sums = new Array(cols.length).fill(null);
     for (let ci = 0; ci < cols.length; ci++) {
+      const col = cols[ci];
+      const type = columnTypes ? columnTypes[ci] : null;
+      const numericKind = isNumericColumn(col, type);
+
+      // 类型明确非数值（黑名单/日期时间/文本且非启发式通道）→ 跳过
+      if (numericKind === false) continue;
+
       let sum = 0;
       let any = false;
       let nonEmpty = 0;
       let numeric = 0;
       for (let i = 0; i < rows.length; i++) {
-        const v = rows[i][cols[ci]];
+        const v = rows[i][col];
         if (v === null || v === undefined || v === "") continue;
         nonEmpty++;
         const n = toNumber(v);
-        if (Number.isNaN(n)) continue;   // 文本：跳过，不影响求和
+        if (Number.isNaN(n)) continue;
         sum += n;
         any = true;
         numeric++;
       }
-      if (any && numeric / nonEmpty >= TOTAL_NUM_RATIO) sums[ci] = sum;
+      if (!any) continue;
+      // 类型明确是数值 → 直接求和；无类型信息/文本类型 → 启发式（数字占比达标才求和）
+      if (numericKind === true || (numericKind === null && numeric / nonEmpty >= TOTAL_NUM_RATIO)) {
+        sums[ci] = sum;
+      }
     }
     return sums;
   }
@@ -2620,7 +2788,7 @@
 
   // 构建完整 table（行号列 + 表头 + from..to 之间数据行 + 底部合计行）；
   // to<=from 时只建空 tbody（虚拟滚动模式由 paint() 填充）。
-  function buildFullTable(cols, rows, from, to) {
+  function buildFullTable(cols, rows, from, to, columnTypes) {
     const table = document.createElement("table");
     const thead = document.createElement("thead");
     const trHead = document.createElement("tr");
@@ -2645,7 +2813,7 @@
 
     // 合计行：「合计」标签放在最左的序号列那一格；数据列统一按
     // 「数字列显示 SUM、非数字列显示 —」。无数据时不输出合计行。
-    const totals = computeColumnTotals(cols, rows);
+    const totals = computeColumnTotals(cols, rows, columnTypes);
     if (totals) {
       const tfoot = document.createElement("tfoot");
       const tr = document.createElement("tr");
@@ -2699,12 +2867,12 @@
     return tr;
   }
 
-  function renderVirtualTable(cell, cols, rows) {
+  function renderVirtualTable(cell, cols, rows, columnTypes) {
     const total = rows.length;
     const wrap = cell.dom.resultWrap;
 
     // tfoot 只建一次（含合计行），滚动重建 tbody 时不动它
-    const table = buildFullTable(cols, rows, 0, 0);  // 表头 + 空 tbody
+    const table = buildFullTable(cols, rows, 0, 0, columnTypes);  // 表头 + 空 tbody
     wrap.appendChild(table);
     const tbody = table.querySelector("tbody");
 
@@ -2743,8 +2911,7 @@
       }
       return;
     }
-    const cols = cell.lastResult.columns;
-    const rows = cell.lastResult.rows || [];
+
     const filename = "query_result_" + new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
 
     const cellStatus = cell.dom.status;
@@ -2754,17 +2921,32 @@
     cellStatus.className = "cell-status";
 
     try {
-      const res = await request("/api/export", {
-        columns: cols,
-        rows,
-        filename,
-      });
+      // 优先走 task_id 直读后端结果缓存：大结果集不经过前端 JSON 回传，避免双重传输。
+      // 仅当任务已过期时回退为前端把 rows 原样传回（兼容旧路径）。
+      const taskId = cell._lastTaskId;
+      let res;
+      if (taskId) {
+        try {
+          res = await request("/api/export", { task_id: taskId, filename });
+        } catch (e) {
+          // 404「结果已过期」→ 回退走前端传参；其他错误原样抛
+          if (String(e?.detail || e) !== "查询结果已过期，请重新查询后再导出") throw e;
+          res = null;
+        }
+      }
+      if (!res) {
+        res = await request("/api/export", {
+          columns: cell.lastResult.columns,
+          rows: cell.lastResult.rows || [],
+          filename,
+        });
+      }
       if (!res || res.cancelled) {
         cellStatus.textContent = prevText;
         cellStatus.className = prevClass;
         return;
       }
-      cellStatus.textContent = `已导出 ${res.rows ?? rows.length} 行 → ${res.path}`;
+      cellStatus.textContent = `已导出 ${res.rows ?? (cell.lastResult.rows || []).length} 行 → ${res.path}`;
       cellStatus.className = "cell-status ok";
     } catch (e) {
       cellStatus.textContent = popError(e);

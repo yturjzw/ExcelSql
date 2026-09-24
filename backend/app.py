@@ -60,6 +60,14 @@ DEFAULT_LIMIT = 100
 # 单次查询最多返回行数，防止超大结果集拖垮浏览器
 MAX_RESULT_ROWS = 10000
 
+# 单次查询硬超时（秒）：DuckDB 无内置 statement_timeout，官方文档要求应用层实现，
+# 这里用后台线程到点调 con.interrupt() 中断正在运行的查询，防止极端 SQL 挂死。
+QUERY_TIMEOUT_S = 300
+
+# 查询结果在内存中的保留时长（秒）：done 后仍留在 _TASKS 供「按 task_id 导出」
+# 直读后端缓存，避免前端把大结果集回传；过期后由惰性清理回收。
+RESULT_TTL_S = 600
+
 # 用户在 SQL 中引用的视图名（指向按路径引用的 Excel 的第一个工作表）
 TABLE_ALIAS = "data"
 
@@ -174,6 +182,55 @@ def _is_cell_conversion_error(e: Exception) -> bool:
     """
     s = str(e).lower()
     return "failed to parse cell" in s or ("could not convert" in s and "read_xlsx" in s)
+
+
+def _human_error(e: Exception, sql: str = "") -> str:
+    """把常见 DuckDB / 连接异常转成中文可读提示（保留原始信息做后缀）。
+
+    分级翻译：
+      - 语法/解析错误 → 提示检查标点、引号、括号（结合全半角高亮）
+      - 表/列/别名不存在 → 提示检查拼写与别名引用（含「data」视图名提示）
+      - 单元格转换错误（用户侧数据问题）→ 提示已自动按文本重读，若仍失败见行
+      - 中断/超时 → 提示用户取消或超时
+      - 连接类（Doris）→ 提示检查连接配置
+      - 其余 → 原样返回（前端 popError 再兜底）
+    """
+    msg = str(e)
+    low = msg.lower()
+    cls = type(e).__name__
+
+    # 查询被 interrupt() 中断：用户手动取消或超时线程触发
+    if cls == "InterruptException" or "interrupted" in low or "interrupt" in low:
+        return f"查询已中断（可能是手动取消或超过时限）。{msg}"
+
+    # 语法错误
+    if cls in ("ParserException", "SyntaxException") or "parser error" in low:
+        return f"SQL 语法错误：请检查语句中的标点（全角/半角）、引号与括号匹配。详情：{msg}"
+
+    # 未找到表 / 列 / 视图 / 别名
+    if cls == "CatalogException" or "catalog error" in low:
+        if "does not exist" in low or "not found" in low:
+            return f"引用的表、列或别名不存在：请检查名称拼写与大小写。详情：{msg}"
+        return f"数据目录错误：{msg}"
+
+    # 绑定错误（列名/类型/函数）
+    if cls in ("BinderException", "TypeMismatchException") or "binder error" in low:
+        return f"SQL 解析/绑定错误：请检查列名、类型与函数用法。详情：{msg}"
+
+    # 单元格类型转换（数据问题，非 SQL 问题）
+    if _is_cell_conversion_error(e):
+        return ("Excel 中存在「文本与数字混列」，已尝试按文本重读；若仍显示此错误，"
+                "请检查该列数据。详情：" + msg)
+
+    # Doris 连接类
+    if cls in ("ConnectionException", "IOException") or "connection" in low or "failed to connect" in low:
+        return f"数据库连接失败：请检查连接配置与网络。详情：{msg}"
+
+    # 内存不足
+    if cls == "OutOfMemoryException" or "out of memory" in low:
+        return f"内存不足：请减小查询范围（加 LIMIT 或筛选条件）。{msg}"
+
+    return msg
 
 
 # CSV 编码检测顺序：UTF-8（含 BOM）优先，失败则按 GBK（中文 Excel 导出默认编码）
@@ -963,9 +1020,10 @@ class QueryRequest(BaseModel):
 
 
 class ExportRequest(BaseModel):
-    columns: list[str]
-    rows: list[dict]
+    columns: list[str] = []
+    rows: list[dict] = []
     filename: str = "query_result"
+    task_id: str = ""   # 可选：提供时直接从后端结果缓存读取 columns/rows，避免前端回传大结果集
 
 
 # ---------- 接口 ----------
@@ -1489,6 +1547,29 @@ def _run_query_task(task_id: str, sources: list[dict], sql: str, limit: int) -> 
         # Doris 源：走进程级共享连接（复用 ATTACH，省掉 ~1.8s 一次性开销）。
         # 整个查询持 _SHARED_LOCK 串行，避免共享连接上的视图/状态被并发踩踏。
         _SHARED_LOCK.acquire()
+
+    # —— 取消与超时看门狗 ——
+    # 取消：前端 POST /api/cancel 置 task["cancelled"]=True，并直接调 task["interrupt_fn"]
+    #       （= con.interrupt()），从另一线程打断阻塞中的 execute()/fetchall()。
+    # 超时：watchdog 线程到点 set() 事件 + 调 interrupt_fn，语义是「整个查询任务
+    #       超过 QUERY_TIMEOUT_S 硬上限」，避免极端 SQL 或缓存构建卡死。
+    # 注意：interrupt flag 会在查询结束（成功/失败）的 Cleanup 阶段自动复位，
+    #       Doris 共享连接的下一个查询不受残留中断影响。
+    timeout_event = threading.Event()
+
+    def _timeout_guard() -> None:
+        time.sleep(QUERY_TIMEOUT_S)
+        timeout_event.set()
+        with _TASKS_LOCK:
+            fn = task.get("interrupt_fn")
+        if fn is not None:
+            try:
+                fn()
+            except Exception:
+                pass
+
+    threading.Thread(target=_timeout_guard, daemon=True).start()
+
     try:
         # 关闭进度条打印，并让 progress_bar 从 0ms 起算进度（否则前 2s 内
         # query_progress() 返回 -1.0，拿不到真实百分比）
@@ -1499,6 +1580,11 @@ def _run_query_task(task_id: str, sources: list[dict], sql: str, limit: int) -> 
             con.execute("SET enable_progress_bar_print = false")
             con.execute("SET progress_bar_time = 0")
             _load_excel(con)
+
+        # 把 interrupt 函数登记到任务：/api/cancel 与超时线程都通过它打断阻塞中的执行。
+        # 先于任何 execute 登记，保证 cancel 在最坏情况（prepare 阶段）也能生效。
+        with _TASKS_LOCK:
+            task["interrupt_fn"] = con.interrupt
 
         # 语句类型决定执行方式：
         #   - SELECT / WITH：注册成临时视图再套 LIMIT（对行注释/块注释/末尾分号都健壮，
@@ -1560,6 +1646,19 @@ def _run_query_task(task_id: str, sources: list[dict], sql: str, limit: int) -> 
                 # 只允许 SELECT/WITH 时重写；元数据语句（describe 等）按原样跑。
                 has_doris = any(s.get("kind") == "doris" for s in sources)
                 exec_sql = _rewrite_doris_sql(sql, sources) if stmt_kind not in ("describe", "show", "summarize", "pragma") else sql
+
+                # 开始一条语句前检查：用户取消 / 超时已触发 → 中断（interrupt() 由
+                # cancel 端点/超时线程调用过，这里主要是防止「取消发生在语句间隙」时
+                # 又滑进下一条 execute）。
+                with _TASKS_LOCK:
+                    cancelled = bool(task.get("cancelled"))
+                if cancelled or timeout_event.is_set():
+                    try:
+                        con.interrupt()
+                    except Exception:
+                        pass
+                    raise duckdb.InterruptException("user cancelled / timeout")
+
                 if stmt_kind in ("describe", "show", "summarize", "pragma"):
                     # 元数据语句：直接执行（不容忍被装进子查询/视图）
                     cur = con.execute(exec_sql)
@@ -1571,12 +1670,28 @@ def _run_query_task(task_id: str, sources: list[dict], sql: str, limit: int) -> 
                     con.execute(f"CREATE OR REPLACE VIEW {qtmp} AS {exec_sql}")
                     cur = con.execute(f"SELECT * FROM {qtmp} LIMIT {limit}")
                 columns = [str(d[0]) for d in cur.description]
+                column_types = [str(d[1]).lower() for d in cur.description]
                 raw_rows = cur.fetchall()
                 elapsed_ms = (time.perf_counter() - t0) * 1000.0       # SQL 执行段
                 total_ms = (time.perf_counter() - t_start) * 1000.0    # 含准备段的全流程
                 prepare_ms = total_ms - elapsed_ms                     # 读文件/缓存构建段
                 break  # 查询成功，跳出回退循环
             except Exception as e:
+                # 用户取消 / 超时中断：不再回退重试，直接标记 cancelled / timeout 状态
+                with _TASKS_LOCK:
+                    cancelled = bool(task.get("cancelled"))
+                if cancelled:
+                    task["status"] = "cancelled"
+                    task["phase"] = "cancelled"
+                    task["error"] = "查询已取消"
+                    task["done_at"] = time.time()
+                    return
+                if timeout_event.is_set() or isinstance(e, duckdb.InterruptException):
+                    task["status"] = "timeout"
+                    task["phase"] = "timeout"
+                    task["error"] = f"查询超过 {QUERY_TIMEOUT_S} 秒未完成，已自动中止"
+                    task["done_at"] = time.time()
+                    return
                 # 首次扫描触发「数字列里夹杂文本」的转换错误时，回退为全文本重读
                 if not all_varchar and _is_cell_conversion_error(e):
                     continue
@@ -1599,8 +1714,10 @@ def _run_query_task(task_id: str, sources: list[dict], sql: str, limit: int) -> 
             task["status"] = "done"
             task["phase"] = "done"
             task["progress"] = 100.0
+            task["done_at"] = time.time()   # 结果保留锚点：RESULT_TTL_S 内可被 /api/export 按 task_id 直读
             task["result"] = {
                 "columns": columns,
+                "column_types": column_types,   # 与 columns 对齐的 DuckDB 类型名（前端据此判定合计列）
                 "rows": rows,
                 "row_count": len(rows),
                 "limit": limit,
@@ -1614,12 +1731,26 @@ def _run_query_task(task_id: str, sources: list[dict], sql: str, limit: int) -> 
         with _TASKS_LOCK:
             task["status"] = "error"
             task["phase"] = "error"
-            task["error"] = str(getattr(e, "detail", "查询失败"))
+            task["done_at"] = time.time()
+            task["error"] = _human_error(e, sql)
+    except duckdb.InterruptException:
+        # 未走上面的 cancelled/timeout 分支（如 fetchall 中被中断）也归入中断态
+        with _TASKS_LOCK:
+            if bool(task.get("cancelled")):
+                task["status"] = "cancelled"
+                task["phase"] = "cancelled"
+                task["error"] = "查询已取消"
+            else:
+                task["status"] = "timeout"
+                task["phase"] = "timeout"
+                task["error"] = f"查询超过 {QUERY_TIMEOUT_S} 秒未完成，已自动中止"
+            task["done_at"] = time.time()
     except Exception as e:  # noqa: BLE001
         with _TASKS_LOCK:
             task["status"] = "error"
             task["phase"] = "error"
-            task["error"] = f"SQL 执行出错: {e}"
+            task["done_at"] = time.time()
+            task["error"] = _human_error(e, sql)
     finally:
         if has_doris:
             # 共享连接由应用退出时统一关闭（_close_shared_con），这里只释放锁
@@ -1682,8 +1813,21 @@ class ProgressRequest(BaseModel):
 
 @app.post("/api/progress")
 async def query_progress(payload: ProgressRequest) -> dict:
-    """查询任务进度：{ status, progress, result?, error? }。done 时附带 result。"""
+    """查询任务进度：{ status, progress, result?, error? }。done 时附带 result。
+
+    done 后结果会按 RESULT_TTL_S 保留在内存（供 /api/export 按 task_id 直读导出，
+    避免前端把大结果集回传）；顺带惰性清理过期任务。
+    """
+    now = time.time()
     with _TASKS_LOCK:
+        # 惰性清理：回收已完成且超过保留时长的任务，避免长时间运行后堆积
+        expired = [
+            tid for tid, t in _TASKS.items()
+            if t.get("done_at") and now - t["done_at"] > RESULT_TTL_S
+        ]
+        for tid in expired:
+            _TASKS.pop(tid, None)
+
         task = _TASKS.get(payload.task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="查询任务不存在或已过期")
@@ -1693,16 +1837,38 @@ async def query_progress(payload: ProgressRequest) -> dict:
         "phase": task.get("phase", "run"),
         "progress": round(float(task.get("progress", 0.0)), 2),
     }
-    if status == "done":
-        out["result"] = task.get("result")
-        # 返回后即可清理，避免任务堆积
-        with _TASKS_LOCK:
-            _TASKS.pop(payload.task_id, None)
-    elif status == "error":
-        out["error"] = task.get("error")
-        with _TASKS_LOCK:
-            _TASKS.pop(payload.task_id, None)
+    if status in ("done", "error", "cancelled", "timeout"):
+        # done 保留结果；error/cancelled/timeout 返回原因。不立即 pop：
+        # done 供导出复用；终态统一走惰性清理。
+        if status == "done":
+            out["result"] = task.get("result")
+        else:
+            out["error"] = task.get("error")
     return out
+
+
+class CancelRequest(BaseModel):
+    task_id: str
+
+
+@app.post("/api/cancel")
+async def cancel_query(payload: CancelRequest) -> dict:
+    """取消一个正在运行的查询：置 cancelled 标志，并立即 interrupt() 打断阻塞中的 execute。"""
+    with _TASKS_LOCK:
+        task = _TASKS.get(payload.task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="查询任务不存在或已过期")
+        if task["status"] not in ("running",):
+            raise HTTPException(status_code=400, detail="查询已结束，无法取消")
+        task["cancelled"] = True
+        # 立即从本线程打断：执行线程正阻塞在 execute() 时也能终止
+        fn = task.get("interrupt_fn")
+    if fn is not None:
+        try:
+            fn()
+        except Exception:
+            pass
+    return {"ok": True}
 
 
 def _export_to_file(columns: list[str], rows: list[dict], save_path: str, fmt: str) -> int:
@@ -1731,9 +1897,25 @@ def _export_to_file(columns: list[str], rows: list[dict], save_path: str, fmt: s
 
 @app.post("/api/export")
 async def export_result(payload: ExportRequest) -> dict:
-    """弹出「另存为」对话框，把查询结果导出为 Excel(.xlsx) 或 CSV。"""
-    columns = payload.columns or []
-    rows = payload.rows or []
+    """弹出「另存为」对话框，把查询结果导出为 Excel(.xlsx) 或 CSV。
+
+    数据来源二选一：
+      - payload.task_id：从后端结果缓存直读（推荐，大结果集不走前端回传）
+      - payload.columns/rows：前端显式传入（兼容旧调用）
+    """
+    columns: list[str] = []
+    rows: list[dict] = []
+    if payload.task_id:
+        with _TASKS_LOCK:
+            task = _TASKS.get(payload.task_id)
+        if task is None or task.get("status") != "done":
+            raise HTTPException(status_code=404, detail="查询结果已过期，请重新查询后再导出")
+        res = task.get("result") or {}
+        columns = res.get("columns") or []
+        rows = res.get("rows") or []
+    else:
+        columns = payload.columns or []
+        rows = payload.rows or []
     if not columns:
         raise HTTPException(status_code=400, detail="没有可导出的列")
 
@@ -1756,6 +1938,57 @@ async def export_result(payload: ExportRequest) -> dict:
         return {"saved": True, "cancelled": False, "path": str(save_path), "format": fmt, "rows": count}
 
     return await asyncio.to_thread(_choose_and_write)
+
+
+# ---------- 查询缓存管理 ----------
+
+
+def _cache_entries() -> list[dict]:
+    """扫描 parquet 缓存目录，返回 [{name, size, mtime}]（按时间倒序）。"""
+    root = _cache_root()
+    out: list[dict] = []
+    try:
+        for p in root.glob("*.parquet"):
+            try:
+                st = p.stat()
+                out.append({
+                    "name": p.name,
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                })
+            except OSError:
+                continue
+    except OSError:
+        pass
+    out.sort(key=lambda x: x["mtime"], reverse=True)
+    return out
+
+
+@app.post("/api/cache/info")
+async def cache_info() -> dict:
+    """查询缓存目录信息：{ count, size_bytes, dir }。"""
+    entries = _cache_entries()
+    return {
+        "count": len(entries),
+        "size_bytes": sum(e["size"] for e in entries),
+        "dir": str(_cache_root()),
+    }
+
+
+@app.post("/api/cache/clear")
+async def cache_clear() -> dict:
+    """清空全部 parquet 缓存（下次查询自动重建）。"""
+    removed = 0
+    freed = 0
+    for e in _cache_entries():
+        p = _cache_root() / e["name"]
+        try:
+            p.unlink(missing_ok=True)
+            removed += 1
+            freed += e["size"]
+        except OSError:
+            pass
+    return {"removed": removed, "freed_bytes": freed}
 
 
 # 挂载前端静态页面
