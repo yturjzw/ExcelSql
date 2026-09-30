@@ -1710,7 +1710,7 @@ li.CodeMirror-hint-active {
   min-width: 44px;
   max-width: 44px;
   width: 44px;
-  text-align: right;
+  text-align: center;
   color: var(--muted-2);
   background: var(--bg-soft);
   user-select: none;
@@ -1757,5 +1757,5 @@ tfoot tr.totals-row td {
 }
 tfoot tr.totals-row td.row-index-cell {
   color: var(--muted);      /* 覆盖外层 td 的深色，标签保持低调 */
-  text-align: right;
+  text-align: center;
 }

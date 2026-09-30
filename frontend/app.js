@@ -2834,7 +2834,7 @@
     return table;
   }
 
-  // 行号列单元格：灰底、右对齐、等宽、窄列
+  // 行号列单元格：灰底、居中、等宽、窄列
   function buildRowIndexCell(i) {
     const td = document.createElement("td");
     td.className = "row-index-cell";
