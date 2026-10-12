@@ -591,10 +591,14 @@ def _message_box_yesno(title: str, text: str, *, default_no: bool = True) -> boo
 
 
 def _fallback_to_browser(url: str, _reason: str) -> bool:
-    """窗口链路失败时的浏览器降级：打开系统浏览器访问内嵌服务并提示用户。
+    """窗口链路失败时的浏览器降级：打开系统浏览器访问内嵌服务。
 
     返回 True＝用户选择立即退出应用；False＝保持后台运行（继续服务）。
     失败的细节只进日志，不再把「失败」字样挂在用户面前。
+
+    由于冻结产物的原生窗口链路每次都会失败（见 _diagnose 的 pythonnet 定位结论），
+    这条说明只在**首次进入浏览器模式**时弹出一次；用户选「保持运行」后写入标记，
+    之后每次启动直接静默打开浏览器，不再打扰。
     """
     try:
         import webbrowser
@@ -603,16 +607,26 @@ def _fallback_to_browser(url: str, _reason: str) -> bool:
             _log("webbrowser.open returned False")
     except Exception as e:  # noqa: BLE001
         _log(f"webbrowser.open failed: {e}")
-    return _message_box_yesno(
+
+    # 已记住「保持运行」：静默降级，不再弹提示。
+    if _fallback_silent_remembered():
+        _log("browser fallback: silent (remembered keep-running)")
+        return False
+
+    exit_now = _message_box_yesno(
         "Excel SQL 查询台",
-        "桌面窗口组件在当前环境不可用，已自动改用系统浏览器打开查询台。\n"
+        "已自动改用系统浏览器打开查询台。\n"
         "页面功能与桌面窗口完全一致（查询 Excel / Doris / Oracle 等）。\n\n"
         "· 「退出应用」＝结束后台服务，浏览器页面也会随之失效；\n"
         "· 「保持运行」＝关闭本提示，查询台继续在浏览器中工作。\n\n"
-        f"查询台空闲 {_FALLBACK_IDLE_EXIT_S // 60} 分钟会自动退出；\n"
+        "此提示只在首次出现一次，选择「保持运行」后本次内不再重复；\n"
+        f"查询台空闲 {_FALLBACK_IDLE_EXIT_S // 60} 分钟会自动退出，\n"
         "使用中再次双击 ExcelSqlConsole 可重新打开页面。",
         default_no=True,
     )
+    if not exit_now:
+        _remember_fallback_silent()
+    return exit_now
 
 
 def _wait_fallback_idle(backend_app, server_thread) -> None:
@@ -673,6 +687,35 @@ def _read_last_port() -> int | None:
             return int(f.read().strip())
     except Exception:  # noqa: BLE001
         return None
+
+
+def _fallback_flag_path() -> str:
+    """fallback_silent.flag 路径：LOCALAPPDATA；不可用则回退 exe 所在目录。"""
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        try:
+            d = os.path.join(local, "ExcelSqlConsole")
+            os.makedirs(d, exist_ok=True)
+            return os.path.join(d, "fallback_silent.flag")
+        except OSError:
+            pass
+    return _exe_dir_path("fallback_silent.flag")
+
+
+def _fallback_silent_remembered() -> bool:
+    """用户是否已选择过「保持运行」（此后浏览器降级静默进行）。"""
+    return os.path.exists(_fallback_flag_path())
+
+
+def _remember_fallback_silent() -> None:
+    """记录「保持运行」选择（此后浏览器降级不再弹提示）。"""
+    try:
+        p = _fallback_flag_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("keep_running")
+    except Exception:  # noqa: BLE001
+        _log(f"write fallback flag failed:\n{traceback.format_exc()}")
 
 
 def _is_url_alive(url: str, timeout: float = 1.0) -> bool:
