@@ -18,6 +18,11 @@ import threading
 import time
 import traceback
 
+# QtWebEngine（pywebview gui="qt"）在远程桌面/虚拟显示（如 Todesk、RDP、虚拟机）下
+# GPU 硬件加速会失效，表现为窗口白屏。禁用 GPU 加速改走 Chromium 软件渲染
+# （与旧版 WebView2 的 --disable-gpu 同理）。须早于任何 Qt 初始化，故放模块顶部。
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu")
+
 # 单实例互斥锁：用 Local 命名空间（按会话隔离）。Global\ 需要 SeCreateGlobalPrivilege，
 # 受限制令牌下创建会失败进而误判为“已有实例”，导致应用静默退出（历史踩坑）。
 MUTEX_NAME = "Local\\ExcelSqlConsole_SingleInstance"
