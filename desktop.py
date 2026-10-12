@@ -247,49 +247,16 @@ def _diagnose() -> int:
     except Exception as e:  # noqa: BLE001
         emit(f"openpyxl: IMPORT FAILED {e}")
 
-    # 验证窗口链路（pythonnet/.NET 桥 + WebView2 平台模块）在冻结环境下可用。
-    # 这一层失败不会影响后端/前端，但会让桌面窗口无法弹出（历史教训：pythonnet
-    # 版本与 clr_loader 不匹配时，这里 import clr 即报 Failed to initialize
-    # Python.Runtime.dll，而旧版自检完全发现不了）。
-    _ensure_native_dll_paths()
-    if getattr(sys, "frozen", False):
-        # 原生 DLL 加载探针：判定冻结环境加载失败发生在哪一层
-        try:
-            import ctypes
-            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            base = sys._MEIPASS
-            pruntime = os.path.join(base, "pythonnet", "runtime", "Python.Runtime.dll")
-            h1 = k32.LoadLibraryW("python312.dll")
-            e1 = ctypes.get_last_error()
-            h2 = k32.LoadLibraryW(pruntime)
-            e2 = ctypes.get_last_error()
-            emit(f"probe: LoadLibraryW('python312.dll') = {h1 and hex(h1) or 'NULL'} (err={e1})")
-            emit(f"probe: LoadLibraryW(Python.Runtime.dll) = {h2 and hex(h2) or 'NULL'} (err={e2})")
-        except Exception as e:  # noqa: BLE001
-            emit(f"probe FAILED: {e}")
-        # 低层逐步探测：精确定位 clr_loader 在哪一步返回 NULL
-        try:
-            from clr_loader import ffi as _ffipkg
-            emit(f"probe: _MEIPASS={getattr(sys, '_MEIPASS', None)!r} cwd={os.getcwd()!r}")
-            _fw = _ffipkg.load_netfx()
-            _fw.pyclr_initialize()
-            _dom = _fw.pyclr_create_appdomain(b"pynet_probe", _ffipkg.ffi.NULL)
-            emit(f"probe: pyclr_create_appdomain -> {_dom!r}")
-            # 注意：类名必须是 "Python.Runtime.Loader"、方法名必须是 "Initialize"，
-            # 与 pythonnet 经由 clr_loader Assembly.get_function("Python.Runtime.Loader.Initialize")
-            # 拆分后的参数完全一致（历史探针传错参数，导致永远 NULL，误导排查）。
-            _fn = _fw.pyclr_get_function(
-                _dom, pruntime.encode("utf-8"), b"Python.Runtime.Loader", b"Initialize"
-            )
-            emit(f"probe: pyclr_get_function -> {_fn!r}")
-        except Exception as e:  # noqa: BLE001
-            emit(f"probe STEP FAILED: {type(e).__name__}: {e!r}")
+    # 验证窗口后端链路：pywebview qt（QtWebEngine / PySide6），不依赖 pythonnet。
+    # 历史：edgechromium(WebView2) 需要 pythonnet，而它在 PyInstaller 冻结产物里每次都
+    # 初始化失败（Failed to resolve Python.Runtime.Loader.Initialize），已弃用统一改 qt。
     try:
         import webview  # noqa: F401
-        import webview.platforms.edgechromium  # noqa: F401  触发 clr/pythonnet 初始化
-        emit("webview/edgechromium: importable (pythonnet OK)")
+        import webview.platforms.qt  # noqa: F401  触发 qtpy/PySide6 导入
+        from PySide6.QtWebEngineWidgets import QWebEngineView  # noqa: F401
+        emit("window backend qt: importable (PySide6/QtWebEngine OK)")
     except Exception as e:  # noqa: BLE001
-        emit(f"webview/edgechromium: IMPORT FAILED {e}")
+        emit(f"window backend qt: IMPORT FAILED {e}")
 
     # 起服务并访问 /api/health 与 /，验证完整链路
     port = backend_app.find_free_port()
@@ -496,21 +463,15 @@ def main() -> int:
         _message_box("启动失败", "后端服务未能就绪，请稍后重试。")
         return 1
 
-    # 3) 弹出原生窗口
-    # 冻结环境：先把包内原生 DLL 目录加入搜索路径，否则 pythonnet 的
-    # LoadLibrary 找不到 python312.dll，import webview 即失败（见 _ensure_native_dll_paths）。
-    _ensure_native_dll_paths()
+    # 3) 弹出原生窗口（QtWebEngine 内嵌 Chromium，不依赖 pythonnet/.NET 桥）。
+    #    历史：edgechromium(WebView2) 需要 pythonnet，而它在 PyInstaller 冻结产物里
+    #    每次都初始化失败（Failed to resolve Python.Runtime.Loader.Initialize），
+    #    已弃用，统一改用 Qt 后端；Qt 也不可用时才降级为系统浏览器。
     try:
         try:
             import webview
         except Exception as e:  # noqa: BLE001
-            raise RuntimeError(f"无法加载窗口组件（WebView2）：{e}") from e
-
-        # P0 内存优化：必须在 webview.start()（触发 WebView2 实例化）前 patch
-        try:
-            _patch_edgechromium_args()
-        except Exception as e:  # noqa: BLE001
-            _log(f"edgechromium patch failed (fallback to default args):\n{traceback.format_exc()}")
+            raise RuntimeError(f"无法加载窗口组件（QtWebEngine）：{e}") from e
 
         window = webview.create_window(
             WINDOW_TITLE,
@@ -520,10 +481,9 @@ def main() -> int:
             min_size=(960, 640),
             confirm_close=False,
         )
-        webview.start(gui="edgechromium")  # Windows 下走 WebView2；阻塞至窗口关闭
+        webview.start(gui="qt")  # QtWebEngine 原生窗口；阻塞至窗口关闭
     except Exception as e:  # noqa: BLE001
-        # 窗口链路失败（典型：pythonnet/.NET 桥在冻结环境初始化失败）时不退出，
-        # 降级为「系统浏览器打开内嵌服务」，保证打包产物仍可用。
+        # 窗口链路失败时不退出，降级为「系统浏览器打开内嵌服务」，保证产物仍可用。
         _log(f"desktop window unavailable -> browser fallback:\n{traceback.format_exc()}")
         exit_now = _fallback_to_browser(url, str(e))
         if not exit_now:

@@ -3,39 +3,49 @@
 
 入口 desktop.py：
   - 内嵌 FastAPI + DuckDB（含 excel 扩展，离线）后台服务
-  - pywebview（WebView2）原生窗口
+  - pywebview（gui="qt"，QtWebEngine / PySide6）原生窗口
 
 生成产物：dist/ExcelSqlConsole/ExcelSqlConsole.exe
 """
 from PyInstaller.utils.hooks import collect_all
 import sys  # noqa: F401   PyInstaller 6.x 不自动注入 sys，spec 内需显式导入
+import os
 
 block_cipher = None
 
-# pywebview（winforms/edgechromium 依赖 pythonnet 的 .NET 程序集与动态库）
+# pywebview（qt 后端）
 webview_datas, webview_binaries, webview_hidden = collect_all("webview")
 
-# pythonnet 运行时目录（含 Python.Runtime.dll 与配套 deps.json/pdb/xml）。
-# 历史教训：hook-clr 只收集了 Python.Runtime.dll，漏掉 runtime 目录里的
-# Python.Runtime.deps.json，冻结环境下 clr 初始化表现为
-# 'Failed to resolve Python.Runtime.Loader.Initialize'，故整体打包该目录。
-import os as _os
-_pythonnet_rt = _os.path.join(sys.prefix, "Lib", "site-packages", "pythonnet", "runtime")
-if not _os.path.isdir(_pythonnet_rt):
-    _pythonnet_rt = None
+# QtWebEngine 原生窗口后端：PySide6 6.x 拆分为多个包，另有 qtpy shim。
+# 统一 collect_all，交给 PyInstaller 内置 hook（hook-PySide6 / hook-qtpy）收集
+# QtWebEngineProcess.exe、resources、translations 等运行时资源。
+_qt_datas, _qt_bins, _qt_hidden = [], [], []
+for _pkg in (
+    "PySide6",
+    "PySide6_Essentials",
+    "PySide6_Addons",
+    "PySide6_WebEngine",
+    "shiboken6",
+    "qtpy",
+):
+    try:
+        _d, _b, _h = collect_all(_pkg)
+        _qt_datas += _d
+        _qt_bins += _b
+        _qt_hidden += _h
+    except Exception:
+        pass
 
 a = Analysis(
     ["desktop.py"],
     pathex=["."],
-    binaries=webview_binaries,
-    datas=webview_datas + [
+    binaries=webview_binaries + _qt_bins,
+    datas=webview_datas + _qt_datas + [
         ("frontend", "frontend"),          # 前端静态资源
         ("duckdb_ext", "duckdb_ext"),      # DuckDB excel 扩展（离线）
-    ] + ([(_pythonnet_rt, "pythonnet/runtime")] if _pythonnet_rt else []),
-    hiddenimports=webview_hidden + [
-        "webview.platforms.winforms",
-        "webview.platforms.edgechromium",
-        "clr_loader",
+    ],
+    hiddenimports=webview_hidden + _qt_hidden + [
+        "webview.platforms.qt",
         "openpyxl",                 # 结果导出 Excel(.xlsx)
     ],
     hookspath=[],
