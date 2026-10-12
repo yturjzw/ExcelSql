@@ -134,29 +134,39 @@ excel-sql-web/
 
 ## 打包为 Windows 桌面应用
 
-源码开发用浏览器访问；也可打包成**双击即用的原生桌面窗口**（内嵌后端，无浏览器地址栏，离线可用）。
+源码开发用浏览器访问；也可打包成**双击即用的桌面应用**（内嵌后端，离线可用）。优先弹 `pywebview`（WebView2）原生窗口；若当前打包环境无法初始化窗口组件（pythonnet/.NET 桥在 PyInstaller 冻结产物中的已知限制），自动降级为**系统浏览器打开内嵌服务**，功能与原生窗口完全一致，见下文「浏览器降级」。
 
 ```bash
-# 在 venv 中安装打包依赖
-.venv\Scripts\python.exe -m pip install pywebview pyinstaller
+# 在 venv 中安装打包依赖（版本已实测钉住；pythonnet/clr_loader 版本必须匹配）
+.venv\Scripts\python.exe -m pip install "pythonnet==3.0.3" "clr_loader==0.2.6" pywebview pyinstaller
 
 # 一键打包（onedir 文件夹，产物在 dist\ExcelSqlConsole\）
 .venv\Scripts\python.exe build.py
 ```
 
-流程：`desktop.py` 是桌面入口 —— 单实例互斥锁（重复双击只唤起已有窗口）→ 选空闲端口后台启动 FastAPI → 待后端就绪后弹 `pywebview`（WebView2）窗口 → 关闭窗口时优雅停服务。
+> ⚠️ 打包依赖组合务必按上面的版本钉住：pythonnet 3.0.x 与 clr_loader 0.2.x 强耦合；
+> 已实测 3.1.0 在此环境完全不可用（venv 与冻结均报 `Failed to initialize Python.Runtime.dll`）。
+
+流程：`desktop.py` 是桌面入口 —— 单实例互斥锁（重复双击只唤起已有实例）→ 选空闲端口后台启动 FastAPI → 待后端就绪后弹 `pywebview`（WebView2）窗口 → 关闭窗口时优雅停服务。
+
+**浏览器降级（窗口不可用时的自动兜底）**：若窗口组件初始化失败（冻结产物的 pythonnet/.NET 桥初始化失败是已知环境限制，诊断输出里的 `webview/edgechromium: IMPORT FAILED` 即此情形），应用不会退出或报错，而是：
+1. 自动用系统浏览器打开内嵌服务（`http://127.0.0.1:<端口>/`），页面功能与原生窗口完全一致；
+2. 弹出说明对话框，「退出应用 / 保持运行」二选一，默认「保持运行」——服务继续在浏览器中工作；
+3. 空闲 30 分钟无请求自动退出；使用中再次双击 exe 会把已有实例的页面重新在浏览器打开；
+4. 失败细节只写 `%LOCALAPPDATA%\ExcelSqlConsole\app.log`（或 exe 同级 `app.log`），不打扰用户。
 
 | 事项 | 处理 |
 | --- | --- |
 | 前端/扩展资源定位 | `backend/app.py` 的 `_resource_base()`：冻结后用 `sys._MEIPASS`，源码用项目目录 |
 | 文件选择/另存对话框 | 进程内 `tkinter`（不用 `sys.executable -c` 子进程，冻结后会坏） |
 | DuckDB 扩展 | 随包携带 `duckdb_ext/excel.duckdb_extension` 与 `mysql_scanner.duckdb_extension`，离线按绝对路径加载 |
-| 端口 | 动态空闲端口（`find_free_port()`），不写死 8000 |
-| 打包配置 | `packaging.spec`：`console=False` 窗口化，`collect_all("webview")` 收集 WebView2 .NET 程序集 |
+| 端口 | 动态空闲端口（`find_free_port()`），不写死 8000；端口记 `%LOCALAPPDATA%\ExcelSqlConsole\last_port.txt`（或 exe 同级）供再次双击唤醒 |
+| 单实例 | `Local\` 命名空间互斥锁（`Global\` 在受限令牌下会创建失败导致静默退出，已改） |
+| 打包配置 | `packaging.spec`：`console=False` 窗口化，`collect_all("webview")` 收集 WebView2 .NET 程序集，`datas` 附带 `pythonnet/runtime` |
 | 降内存 | monkey-patch WebView2 启动参数（`--disable-gpu`、`--renderer-process-limit=1`） |
 | 后台日志 | 崩溃/启动失败写 `%LOCALAPPDATA%\ExcelSqlConsole\app.log` |
 
-产物自检：`dist\ExcelSqlConsole\ExcelSqlConsole.exe --diagnose` 会卸载窗口、验证离线扩展与前端链路，结果写 `dist\ExcelSqlConsole\diagnose.txt`（或 `%LOCALAPPDATA%\ExcelSqlConsole\diagnose.txt`）。
+产物自检：`dist\ExcelSqlConsole\ExcelSqlConsole.exe --diagnose` 会卸载窗口、验证离线扩展与前端链路，结果写 `dist\ExcelSqlConsole\diagnose.txt`（或 `%LOCALAPPDATA%\ExcelSqlConsole\diagnose.txt`）；`--dllprobe` 可进一步定位 pythonnet 冻结加载失败的位点（复制到多目录逐一尝试），排查时用。
 
 > 依赖 **WebView2 Runtime**（Win10/11 及新版 Edge 自带；缺失时 pywebview 会自动下载安装）。
 > onedir 文件夹需整体分发；若要单文件 exe 可改 spec 的 `exclude_binaries` 为打包内嵌（启动更慢、更易被杀软误报）。

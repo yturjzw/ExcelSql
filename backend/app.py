@@ -81,6 +81,18 @@ app.add_middleware(
 )
 
 
+# ---- 桌面启动器「浏览器降级」空闲检测：记录最近一次请求时间 ----
+# desktop.py 在原生窗口组件不可用、改用系统浏览器打开时，靠这个时间戳判断
+# 用户是否还在使用查询台：长时间无任何请求则自动退出后台服务并回收进程。
+async def _touch_last_request(request, call_next):
+    app.state.last_request_at = time.time()
+    return await call_next(request)
+
+
+app.middleware("http")(_touch_last_request)
+app.state.last_request_at = time.time()
+
+
 # ---------- SQLite 持久化（前端 localStorage 迁移目标） ----------
 # 本地桌面应用：历史文件、多源组合、Doris 连接、SQL 会话统一落 SQLite 数据库，
 # 摆脱 WebView2 profile/localStorage 的绑定（清缓存/换 profile 不丢、可备份、可查询）。

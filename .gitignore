@@ -34,3 +34,4 @@ frontend.bak/
 .vscode/
 .DS_Store
 Thumbs.db
+debug.log

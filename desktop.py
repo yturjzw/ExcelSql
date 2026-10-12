@@ -18,10 +18,15 @@ import threading
 import time
 import traceback
 
-MUTEX_NAME = "Global\\ExcelSqlConsole_SingleInstance"
+# 单实例互斥锁：用 Local 命名空间（按会话隔离）。Global\ 需要 SeCreateGlobalPrivilege，
+# 受限制令牌下创建会失败进而误判为“已有实例”，导致应用静默退出（历史踩坑）。
+MUTEX_NAME = "Local\\ExcelSqlConsole_SingleInstance"
 
 WINDOW_TITLE = "EXCEL → SQL 查询台"
 WINDOW_SIZE = (1280, 820)
+
+# 浏览器降级模式：无任何请求超过该时长自动退出（避免后台残留进程）
+_FALLBACK_IDLE_EXIT_S = 30 * 60
 
 # ---- P0 内存优化：给 WebView2 追加降内存的 Chromium 启动参数 ----
 # 本应用是纯静态表格页面，无视频/WebGL/游戏，不需要 GPU 加速；
@@ -242,6 +247,50 @@ def _diagnose() -> int:
     except Exception as e:  # noqa: BLE001
         emit(f"openpyxl: IMPORT FAILED {e}")
 
+    # 验证窗口链路（pythonnet/.NET 桥 + WebView2 平台模块）在冻结环境下可用。
+    # 这一层失败不会影响后端/前端，但会让桌面窗口无法弹出（历史教训：pythonnet
+    # 版本与 clr_loader 不匹配时，这里 import clr 即报 Failed to initialize
+    # Python.Runtime.dll，而旧版自检完全发现不了）。
+    _ensure_native_dll_paths()
+    if getattr(sys, "frozen", False):
+        # 原生 DLL 加载探针：判定冻结环境加载失败发生在哪一层
+        try:
+            import ctypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            base = sys._MEIPASS
+            pruntime = os.path.join(base, "pythonnet", "runtime", "Python.Runtime.dll")
+            h1 = k32.LoadLibraryW("python312.dll")
+            e1 = ctypes.get_last_error()
+            h2 = k32.LoadLibraryW(pruntime)
+            e2 = ctypes.get_last_error()
+            emit(f"probe: LoadLibraryW('python312.dll') = {h1 and hex(h1) or 'NULL'} (err={e1})")
+            emit(f"probe: LoadLibraryW(Python.Runtime.dll) = {h2 and hex(h2) or 'NULL'} (err={e2})")
+        except Exception as e:  # noqa: BLE001
+            emit(f"probe FAILED: {e}")
+        # 低层逐步探测：精确定位 clr_loader 在哪一步返回 NULL
+        try:
+            from clr_loader import ffi as _ffipkg
+            emit(f"probe: _MEIPASS={getattr(sys, '_MEIPASS', None)!r} cwd={os.getcwd()!r}")
+            _fw = _ffipkg.load_netfx()
+            _fw.pyclr_initialize()
+            _dom = _fw.pyclr_create_appdomain(b"pynet_probe", _ffipkg.ffi.NULL)
+            emit(f"probe: pyclr_create_appdomain -> {_dom!r}")
+            # 注意：类名必须是 "Python.Runtime.Loader"、方法名必须是 "Initialize"，
+            # 与 pythonnet 经由 clr_loader Assembly.get_function("Python.Runtime.Loader.Initialize")
+            # 拆分后的参数完全一致（历史探针传错参数，导致永远 NULL，误导排查）。
+            _fn = _fw.pyclr_get_function(
+                _dom, pruntime.encode("utf-8"), b"Python.Runtime.Loader", b"Initialize"
+            )
+            emit(f"probe: pyclr_get_function -> {_fn!r}")
+        except Exception as e:  # noqa: BLE001
+            emit(f"probe STEP FAILED: {type(e).__name__}: {e!r}")
+    try:
+        import webview  # noqa: F401
+        import webview.platforms.edgechromium  # noqa: F401  触发 clr/pythonnet 初始化
+        emit("webview/edgechromium: importable (pythonnet OK)")
+    except Exception as e:  # noqa: BLE001
+        emit(f"webview/edgechromium: IMPORT FAILED {e}")
+
     # 起服务并访问 /api/health 与 /，验证完整链路
     port = backend_app.find_free_port()
     t = threading.Thread(
@@ -275,6 +324,82 @@ def _diagnose() -> int:
     return 0
 
 
+def _dllprobe() -> int:
+    """通过 clr_loader 原生链路逐位点尝试加载 Python.Runtime.dll（定位冻结失败根因）。
+
+    把 Python.Runtime.dll 复制到多个目录逐个调用 pyclr_get_function，再用
+    get_netfx()（无 domain ＝ 根 AppDomain，与 pythonnet 真实调用完全一致）做对照：
+      · 全部位点 FAIL  → 进程/CLR 宿主层问题（与路径无关）
+      · 仅原始位点 FAIL → 路径/目录相关问题
+      · 新域 OK 但根域 FAIL → 根 AppDomain 特定问题
+    """
+    import shutil
+
+    lines = []
+
+    def out(s: str) -> None:
+        lines.append(s)
+        _log(s)
+
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    src = os.path.join(base, "pythonnet", "runtime", "Python.Runtime.dll")
+    candidates = [("原始位点(_MEIPASS\\pythonnet\\runtime)", src)]
+
+    copy_slots = [
+        ("_MEIPASS 根目录", base),
+        ("onedir 根目录(与 exe 同级)", os.path.dirname(base)),
+        ("当前工作目录", os.getcwd()),
+        ("LOCALAPPDATA\\ExcelSqlConsole", os.path.join(os.environ.get("LOCALAPPDATA", ""), "ExcelSqlConsole")),
+        ("系统 TEMP", os.environ.get("TEMP", "")),
+    ]
+    for label, d in copy_slots:
+        try:
+            os.makedirs(d, exist_ok=True)
+            dst = os.path.join(d, "Python.Runtime.dll")
+            shutil.copyfile(src, dst)
+            candidates.append((label, dst))
+        except Exception as e:  # noqa: BLE001
+            out(f"copy[{label}] failed: {e}")
+
+    try:
+        from clr_loader import ffi as _ffipkg
+
+        _fw = _ffipkg.load_netfx()
+        _fw.pyclr_initialize()
+    except Exception as e:  # noqa: BLE001
+        out(f"load_netfx/pyclr_initialize failed: {type(e).__name__}: {e}")
+        _write_diagnose("\n".join(lines))
+        return 1
+
+    for label, path in candidates:
+        try:
+            t0 = time.monotonic()
+            _dom = _fw.pyclr_create_appdomain(b"dllprobe", _ffipkg.ffi.NULL)
+            fn = _fw.pyclr_get_function(
+                _dom, path.encode("utf-8"), b"Python.Runtime.Loader", b"Initialize"
+            )
+            dt = time.monotonic() - t0
+            verdict = "OK  " if fn != _ffipkg.ffi.NULL else "FAIL"
+            out(f"{verdict} {label}: {path} ({dt * 1000:.0f} ms)")
+        except Exception as e:  # noqa: BLE001
+            out(f"ERR  {label}: {path}: {type(e).__name__}: {e}")
+
+    # 对照：完全复刻 pythonnet 的真实调用（get_netfx 无 domain = 根 AppDomain）
+    try:
+        from clr_loader import get_netfx
+
+        rt = get_netfx()
+        asm = rt.get_assembly(src)
+        f = asm.get_function("Python.Runtime.Loader.Initialize")
+        out(f"get_netfx(根域)原始位点 -> OK: {f!r}")
+    except Exception as e:  # noqa: BLE001
+        out(f"get_netfx(根域)原始位点 -> FAIL: {type(e).__name__}: {e}")
+
+    out("== dllprobe 完成 ==")
+    _write_diagnose("\n".join(lines))
+    return 0
+
+
 def _write_diagnose(text: str) -> None:
     """把诊断结果写到 LOCALAPPDATA；若失败，回退写到 exe 所在目录（便于排查/沙箱内测试）。"""
     for target in (DIAG_PATH, _exe_dir_path("diagnose.txt")):
@@ -294,15 +419,50 @@ def _exe_dir_path(name: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
 
 
+def _ensure_native_dll_paths() -> None:
+    """把冻结包内的原生 DLL 目录加入进程的 DLL 搜索路径。
+
+    背景（pythonnet + PyInstaller 已知坑）：clr_loader 通过 LoadLibrary 加载
+    Python.Runtime.dll，而它导入表依赖的 python312.dll 等原生库位于 onedir 的
+    _internal（sys._MEIPASS）根目录，并不在系统 DLL 搜索路径上。不显式加入时，
+    LoadLibrary 返回 NULL，表现为初始化报
+    'Failed to resolve Python.Runtime.Loader.Initialize from ...Python.Runtime.dll'。
+    源码运行加载路径天然命中，无需此处理。
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    if not base:
+        return
+    candidates = [base]
+    for sub in ("pythonnet", os.path.join("pythonnet", "runtime"),
+                "clr_loader", os.path.join("clr_loader", "ffi", "dlls", "amd64")):
+        candidates.append(os.path.join(base, sub))
+    for p in candidates:
+        if os.path.isdir(p):
+            try:
+                os.add_dll_directory(p)
+            except (AttributeError, OSError):
+                pass
+    # PATH 也会被无标志的 LoadLibraryW 搜索到；ClrLoader（原生 C++）加载
+    # Python.Runtime.dll 时并不一定走 add_dll_directory 目录，双保险。
+    try:
+        os.environ["PATH"] = base + os.pathsep + os.environ.get("PATH", "")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main() -> int:
     # 无窗口诊断模式（打包产物自检用）
     if "--diagnose" in sys.argv:
         return _diagnose()
+    # 无窗口 DLL 加载位点探测（定位 pythonnet/python.Runtime.dll 冻结加载失败根因用）
+    if "--dllprobe" in sys.argv:
+        return _dllprobe()
 
     # 单实例：已有实例时本进程直接退出
     mutex = _acquire_single_instance()
     if mutex is None:
-        return 0
+        # 已有实例在运行：把它的查询台页面重新在系统浏览器中打开（避免“双击没反应”）
+        return _reopen_existing()
 
     backend = None
     server_thread = None
@@ -318,6 +478,7 @@ def main() -> int:
 
     # 1) 选空闲端口并后台启动 uvicorn
     port = backend_app.find_free_port()
+    _write_last_port(port)  # 供「已有实例时重新打开浏览器页面」使用
     server_thread = threading.Thread(
         target=_server_target,
         kwargs={"backend_app": backend_app, "host": "127.0.0.1", "port": port},
@@ -336,21 +497,21 @@ def main() -> int:
         return 1
 
     # 3) 弹出原生窗口
+    # 冻结环境：先把包内原生 DLL 目录加入搜索路径，否则 pythonnet 的
+    # LoadLibrary 找不到 python312.dll，import webview 即失败（见 _ensure_native_dll_paths）。
+    _ensure_native_dll_paths()
     try:
-        import webview
-    except Exception as e:  # noqa: BLE001
-        _log(f"webview import failed:\n{traceback.format_exc()}")
-        backend_app.shutdown()
-        _message_box("启动失败", f"无法加载窗口组件（WebView2）：\n{e}")
-        return 1
+        try:
+            import webview
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"无法加载窗口组件（WebView2）：{e}") from e
 
-    # P0 内存优化：必须在 webview.start()（触发 WebView2 实例化）前 patch
-    try:
-        _patch_edgechromium_args()
-    except Exception as e:  # noqa: BLE001
-        _log(f"edgechromium patch failed (fallback to default args):\n{traceback.format_exc()}")
+        # P0 内存优化：必须在 webview.start()（触发 WebView2 实例化）前 patch
+        try:
+            _patch_edgechromium_args()
+        except Exception as e:  # noqa: BLE001
+            _log(f"edgechromium patch failed (fallback to default args):\n{traceback.format_exc()}")
 
-    try:
         window = webview.create_window(
             WINDOW_TITLE,
             url,
@@ -359,19 +520,17 @@ def main() -> int:
             min_size=(960, 640),
             confirm_close=False,
         )
+        webview.start(gui="edgechromium")  # Windows 下走 WebView2；阻塞至窗口关闭
     except Exception as e:  # noqa: BLE001
-        _log(f"create_window failed:\n{traceback.format_exc()}")
-        backend_app.shutdown()
-        _message_box("启动失败", f"创建窗口失败：\n{e}")
-        return 1
-
-    try:
-        webview.start(gui="edgechromium")  # Windows 下走 WebView2
-    except Exception as e:  # noqa: BLE001
-        _log(f"webview.start failed:\n{traceback.format_exc()}")
-        _message_box("运行出错", f"窗口运行失败：\n{e}")
+        # 窗口链路失败（典型：pythonnet/.NET 桥在冻结环境初始化失败）时不退出，
+        # 降级为「系统浏览器打开内嵌服务」，保证打包产物仍可用。
+        _log(f"desktop window unavailable -> browser fallback:\n{traceback.format_exc()}")
+        exit_now = _fallback_to_browser(url, str(e))
+        if not exit_now:
+            # 用户选择「保持运行」：后台服务继续，直到空闲超时或服务线程退出。
+            _wait_fallback_idle(backend_app, server_thread)
     finally:
-        # 4) 窗口关闭：优雅停服务
+        # 4) 窗口关闭（或降级后）优雅停服务
         backend_app.shutdown()
         if server_thread is not None:
             server_thread.join(timeout=3)
@@ -403,14 +562,142 @@ def _wait_until_ready(url: str, timeout: float) -> bool:
     return False
 
 
-def _message_box(title: str, text: str) -> None:
+def _message_box(title: str, text: str, *, icon_error: bool = True) -> None:
+    """信息/错误提示框（不阻塞后端服务线程）。"""
     try:
-        ctypes.windll.user32.MessageBoxW(0, text, title, 0x10)  # MB_ICONERROR
+        flags = 0x10 if icon_error else 0x40  # MB_ICONERROR | MB_ICONINFORMATION
+        ctypes.windll.user32.MessageBoxW(0, text, title, flags)
     except Exception:  # noqa: BLE001
         try:
             print(f"{title}: {text}", file=sys.stderr)
         except Exception:  # noqa: BLE001
             pass
+
+
+def _message_box_yesno(title: str, text: str, *, default_no: bool = True) -> bool:
+    """问询对话框：返回 True=选「是（退出应用）」，False=选「否（保持运行）」。"""
+    flags = 0x04 | 0x40  # MB_YESNO | MB_ICONINFORMATION
+    if default_no:
+        flags |= 0x00000100  # MB_DEFBUTTON2：默认选中「否」，回车不会误退出
+    try:
+        rc = ctypes.windll.user32.MessageBoxW(0, text, title, flags)
+        return rc == 6  # IDYES
+    except Exception:  # noqa: BLE001
+        try:
+            print(f"{title}: {text}", file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
+        return True  # 弹不出对话框时按「退出」处理，避免留僵尸进程
+
+
+def _fallback_to_browser(url: str, _reason: str) -> bool:
+    """窗口链路失败时的浏览器降级：打开系统浏览器访问内嵌服务并提示用户。
+
+    返回 True＝用户选择立即退出应用；False＝保持后台运行（继续服务）。
+    失败的细节只进日志，不再把「失败」字样挂在用户面前。
+    """
+    try:
+        import webbrowser
+
+        if not webbrowser.open(url, new=1):
+            _log("webbrowser.open returned False")
+    except Exception as e:  # noqa: BLE001
+        _log(f"webbrowser.open failed: {e}")
+    return _message_box_yesno(
+        "Excel SQL 查询台",
+        "桌面窗口组件在当前环境不可用，已自动改用系统浏览器打开查询台。\n"
+        "页面功能与桌面窗口完全一致（查询 Excel / Doris / Oracle 等）。\n\n"
+        "· 「退出应用」＝结束后台服务，浏览器页面也会随之失效；\n"
+        "· 「保持运行」＝关闭本提示，查询台继续在浏览器中工作。\n\n"
+        f"查询台空闲 {_FALLBACK_IDLE_EXIT_S // 60} 分钟会自动退出；\n"
+        "使用中再次双击 ExcelSqlConsole 可重新打开页面。",
+        default_no=True,
+    )
+
+
+def _wait_fallback_idle(backend_app, server_thread) -> None:
+    """浏览器降级模式的保活循环：空闲超时或服务线程退出后返回（停服由调用方 finally 完成）。"""
+    while server_thread.is_alive():
+        time.sleep(5)
+        last = getattr(backend_app.state, "last_request_at", None)
+        if last is not None and (time.time() - last) >= _FALLBACK_IDLE_EXIT_S:
+            _log(f"browser fallback idle timeout ({_FALLBACK_IDLE_EXIT_S}s) -> exit")
+            break
+    if not server_thread.is_alive():
+        _log("browser fallback: backend server thread exited unexpectedly -> shutting down")
+
+
+def _last_port_path() -> str:
+    """last_port.txt 路径：LOCALAPPDATA；不可用则回退 exe 所在目录。"""
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        try:
+            d = os.path.join(local, "ExcelSqlConsole")
+            os.makedirs(d, exist_ok=True)
+            return os.path.join(d, "last_port.txt")
+        except OSError:
+            pass
+    return _exe_dir_path("last_port.txt")
+
+
+def _write_last_port(port: int) -> None:
+    """记录本次服务的端口（供「已有实例时重新打开页面」使用）。
+
+    LOCALAPPDATA 与 exe 目录双路径尝试，避免某个位置不可写时静默丢失。
+    """
+    targets = [_last_port_path(), _exe_dir_path("last_port.txt")]
+    seen = set()
+    for t in targets:
+        if t in seen:
+            continue
+        seen.add(t)
+        try:
+            os.makedirs(os.path.dirname(t), exist_ok=True)
+            with open(t, "w", encoding="utf-8") as f:
+                f.write(str(port))
+            return
+        except Exception:  # noqa: BLE001
+            continue
+
+
+def _read_last_port() -> int | None:
+    try:
+        with open(_last_port_path(), "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _is_url_alive(url: str, timeout: float = 1.0) -> bool:
+    import http.client
+    import urllib.parse
+
+    try:
+        host, port = urllib.parse.urlparse(url).netloc.split(":")
+        conn = http.client.HTTPConnection(host, int(port), timeout=timeout)
+        conn.request("GET", "/api/health")
+        ok = conn.getresponse().status == 200
+        conn.close()
+        return ok
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _reopen_existing() -> int:
+    """单实例已被占用：把已有实例的查询台页面重新在系统浏览器中打开。"""
+    port = _read_last_port()
+    url = f"http://127.0.0.1:{port}/" if port else None
+    if url and _is_url_alive(url):
+        try:
+            import webbrowser
+
+            webbrowser.open(url, new=1)
+            _log(f"existing instance on port {port} -> reopened in browser")
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        _log(f"single-instance lock busy but no live server (port={port}) -> exiting")
+    return 0
 
 
 if __name__ == "__main__":
