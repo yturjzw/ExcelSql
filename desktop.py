@@ -19,9 +19,10 @@ import time
 import traceback
 
 # QtWebEngine（pywebview gui="qt"）在远程桌面/虚拟显示（如 Todesk、RDP、虚拟机）下
-# GPU 硬件加速会失效，表现为窗口白屏。禁用 GPU 加速改走 Chromium 软件渲染
-# （与旧版 WebView2 的 --disable-gpu 同理）。须早于任何 Qt 初始化，故放模块顶部。
-os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu")
+# GPU 硬件加速会失效，表现为窗口白屏。经实测：仅 --disable-gpu 仍会白屏（QtWebEngine
+# 6.x 仍尝试创建 GL 上下文 virgl 失败），必须强制 ANGLE 走 SwiftShader 纯软件渲染。
+# 须早于任何 Qt 初始化，故放模块顶部。
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu --use-angle=swiftshader"
 
 # 单实例互斥锁：用 Local 命名空间（按会话隔离）。Global\ 需要 SeCreateGlobalPrivilege，
 # 受限制令牌下创建会失败进而误判为“已有实例”，导致应用静默退出（历史踩坑）。
@@ -391,6 +392,14 @@ def _exe_dir_path(name: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
 
 
+def _app_icon_path() -> str:
+    """窗口图标 assets/app.ico 路径：冻结后 _MEIPASS，源码为项目目录。"""
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", None) or os.path.dirname(sys.executable)
+        return os.path.join(base, "assets", "app.ico")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "app.ico")
+
+
 def _ensure_native_dll_paths() -> None:
     """把冻结包内的原生 DLL 目录加入进程的 DLL 搜索路径。
 
@@ -486,7 +495,7 @@ def main() -> int:
             min_size=(960, 640),
             confirm_close=False,
         )
-        webview.start(gui="qt")  # QtWebEngine 原生窗口；阻塞至窗口关闭
+        webview.start(gui="qt", icon=_app_icon_path())  # QtWebEngine 原生窗口；阻塞至窗口关闭
     except Exception as e:  # noqa: BLE001
         # 窗口链路失败时不退出，降级为「系统浏览器打开内嵌服务」，保证产物仍可用。
         _log(f"desktop window unavailable -> browser fallback:\n{traceback.format_exc()}")

@@ -43,6 +43,7 @@ a = Analysis(
     datas=webview_datas + _qt_datas + [
         ("frontend", "frontend"),          # 前端静态资源
         ("duckdb_ext", "duckdb_ext"),      # DuckDB excel 扩展（离线）
+        ("assets", "assets"),              # 窗口/EXE 图标（app.ico）
     ],
     hiddenimports=webview_hidden + _qt_hidden + [
         "webview.platforms.qt",
