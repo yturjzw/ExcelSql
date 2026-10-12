@@ -22,7 +22,18 @@ import traceback
 # GPU 硬件加速会失效，表现为窗口白屏。经实测：仅 --disable-gpu 仍会白屏（QtWebEngine
 # 6.x 仍尝试创建 GL 上下文 virgl 失败），必须强制 ANGLE 走 SwiftShader 纯软件渲染。
 # 须早于任何 Qt 初始化，故放模块顶部。
-os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu --use-angle=swiftshader"
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu --use-angle=swiftshader --no-sandbox"
+# Chromium sandbox 在 PyInstaller windowed(无控制台) 子系统的进程里初始化失败 → 渲染进程
+# QtWebEngineProcess.exe 起不来 → 页面加载 ok=False、窗口白屏。禁用 sandbox（Qt 官方变量）。
+os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
+
+# 修复白屏根因：PyInstaller 冻结后 Qt 无法靠 QLibraryInfo/qt.conf 定位到 Chromium
+# 渲染进程 QtWebEngineProcess.exe（导致页面加载 ok=False、窗口灰/白屏），须显式指定
+# 其在包内（_MEIPASS/PySide6/）的位置，绕过 QLibraryInfo 的路径推导。
+if getattr(sys, "frozen", False):
+    _proc = os.path.join(getattr(sys, "_MEIPASS", ""), "PySide6", "QtWebEngineProcess.exe")
+    if os.path.exists(_proc):
+        os.environ["QTWEBENGINEPROCESS_PATH"] = _proc
 
 # 单实例互斥锁：用 Local 命名空间（按会话隔离）。Global\ 需要 SeCreateGlobalPrivilege，
 # 受限制令牌下创建会失败进而误判为“已有实例”，导致应用静默退出（历史踩坑）。
@@ -373,6 +384,70 @@ def _dllprobe() -> int:
     return 0
 
 
+def _rendertest() -> int:
+    """冻结环境 QtWebEngine 渲染自检：离屏加载红底页并截图判断是否白屏。
+
+    定位「源码能渲染、冻结白屏」的差异：打印实际生效的渲染环境变量，再抓离屏
+    像素判断软件渲染是否真的在冻结产物里工作。结果写 diagnose 文件与 rendertest.png。
+    """
+    lines = []
+
+    def out(s):
+        lines.append(s)
+        _log(s)
+
+    out(f"QTWEBENGINE_CHROMIUM_FLAGS={os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS')!r}")
+    out(f"QT_OPENGL={os.environ.get('QT_OPENGL')!r}")
+    out(f"QT_ANGLE_PLATFORM={os.environ.get('QT_ANGLE_PLATFORM')!r}")
+    out(f"QT_PLUGIN_PATH={os.environ.get('QT_PLUGIN_PATH')!r}")
+    out(f"QTWEBENGINEPROCESS_PATH={os.environ.get('QTWEBENGINEPROCESS_PATH')!r}")
+
+    png = _exe_dir_path("rendertest.png")
+    try:
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+        from PySide6.QtCore import QTimer, QEventLoop
+
+        app = QApplication([])
+        view = QWebEngineView()
+        view.setHtml(
+            "<html><body style='margin:0;background:#ff0000'>"
+            "<h1 style='color:#fff;font-size:48px'>RT</h1></body></html>"
+        )
+        view.resize(600, 400)
+        view.show()
+        state = {"ok": None}
+        loop = QEventLoop()
+
+        def on_finished(ok):
+            state["ok"] = ok
+            loop.quit()
+
+        view.loadFinished.connect(on_finished)
+        QTimer.singleShot(12000, loop.quit)  # 兜底超时
+        loop.exec()
+        app.processEvents()
+
+        pm = view.grab()
+        pm.save(png)
+        img = pm.toImage()
+        cx, cy = img.width() // 2, img.height() // 2
+        c = img.pixelColor(cx, cy)
+        nonwhite = c.red() != 255 or c.green() != 255 or c.blue() != 255
+        out(
+            f"load_finished ok={state['ok']} "
+            f"rendered={pm.width()}x{pm.height()} center RGB=({c.red()},{c.green()},{c.blue()}) "
+            f"-> {'渲染OK' if nonwhite else '白屏'}"
+        )
+        app.quit()
+    except Exception as e:  # noqa: BLE001
+        out(f"rendertest FAILED: {type(e).__name__}: {e}")
+        out(traceback.format_exc())
+
+    _write_diagnose("\n".join(lines))
+    return 0
+
+
 def _write_diagnose(text: str) -> None:
     """把诊断结果写到 LOCALAPPDATA；若失败，回退写到 exe 所在目录（便于排查/沙箱内测试）。"""
     for target in (DIAG_PATH, _exe_dir_path("diagnose.txt")):
@@ -438,6 +513,9 @@ def main() -> int:
     # 无窗口 DLL 加载位点探测（定位 pythonnet/python.Runtime.dll 冻结加载失败根因用）
     if "--dllprobe" in sys.argv:
         return _dllprobe()
+    # 无窗口 QtWebEngine 渲染自检（离屏加载红底页截图判色，定位白屏根因用）
+    if "--rendertest" in sys.argv:
+        return _rendertest()
 
     # 单实例：已有实例时本进程直接退出
     mutex = _acquire_single_instance()
