@@ -84,13 +84,18 @@ app.add_middleware(
 # ---- 桌面启动器「浏览器降级」空闲检测：记录最近一次请求时间 ----
 # desktop.py 在原生窗口组件不可用、改用系统浏览器打开时，靠这个时间戳判断
 # 用户是否还在使用查询台：长时间无任何请求则自动退出后台服务并回收进程。
+# 注意：desktop.py 通过 `from backend import app` 拿到的是**模块**句柄，
+# 所以必须用模块级变量（而非 FastAPI 实例的 app.state，模块访问不到实例）。
+last_request_at = time.time()
+
+
 async def _touch_last_request(request, call_next):
-    app.state.last_request_at = time.time()
+    global last_request_at
+    last_request_at = time.time()
     return await call_next(request)
 
 
 app.middleware("http")(_touch_last_request)
-app.state.last_request_at = time.time()
 
 
 # ---------- SQLite 持久化（前端 localStorage 迁移目标） ----------

@@ -616,13 +616,20 @@ def _fallback_to_browser(url: str, _reason: str) -> bool:
 
 
 def _wait_fallback_idle(backend_app, server_thread) -> None:
-    """浏览器降级模式的保活循环：空闲超时或服务线程退出后返回（停服由调用方 finally 完成）。"""
+    """浏览器降级模式的保活循环：空闲超时或服务线程退出后返回（停服由调用方 finally 完成）。
+
+    降级模式是最后手段，任何小异常都不能让应用「致命错误」退出：读时间戳失败时
+    跳过空闲判定（按永不空闲处理），只靠服务线程存活状态兜底。
+    """
     while server_thread.is_alive():
         time.sleep(5)
-        last = getattr(backend_app.state, "last_request_at", None)
-        if last is not None and (time.time() - last) >= _FALLBACK_IDLE_EXIT_S:
-            _log(f"browser fallback idle timeout ({_FALLBACK_IDLE_EXIT_S}s) -> exit")
-            break
+        try:
+            last = getattr(backend_app, "last_request_at", None)
+            if last is not None and (time.time() - last) >= _FALLBACK_IDLE_EXIT_S:
+                _log(f"browser fallback idle timeout ({_FALLBACK_IDLE_EXIT_S}s) -> exit")
+                break
+        except Exception:  # noqa: BLE001
+            _log(f"browser fallback idle check failed:\n{traceback.format_exc()}")
     if not server_thread.is_alive():
         _log("browser fallback: backend server thread exited unexpectedly -> shutting down")
 
