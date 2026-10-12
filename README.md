@@ -168,6 +168,17 @@ excel-sql-web/
 
 产物自检：`dist\ExcelSqlConsole\ExcelSqlConsole.exe --diagnose` 会卸载窗口、验证离线扩展与前端链路，结果写 `dist\ExcelSqlConsole\diagnose.txt`（或 `%LOCALAPPDATA%\ExcelSqlConsole\diagnose.txt`）；`--dllprobe` 可进一步定位 pythonnet 冻结加载失败的位点（复制到多目录逐一尝试），排查时用。
 
+**代码签名与 SmartScreen**：PyInstaller 产物无 Authenticode 签名，双击会弹「Microsoft Defender SmartScreen 阻止了无法识别的应用启动」。运行一次签名脚本即可在本机消除该提示（发布者显示 `ExcelSql Console`）：
+
+```powershell
+# 生成自签名代码签名证书（首次，5 年有效）→ 签名（带时间戳）→ 加入本机受信任的根/发布者
+powershell -ExecutionPolicy Bypass -File scripts\sign.ps1
+```
+
+> 脚本幂等：证书只生成一次，重复运行会复用；**每次重新打包后重跑一次**即可保证产物签名最新。
+
+> 说明：签名与信任均作用于**本机/当前用户**；产物拷到其他电脑仍会提示未知发布者，需要在那台机器执行同一脚本，或购买商业代码签名证书（OV/EV）实现全局可信。
+
 > 依赖 **WebView2 Runtime**（Win10/11 及新版 Edge 自带；缺失时 pywebview 会自动下载安装）。
 > onedir 文件夹需整体分发；若要单文件 exe 可改 spec 的 `exclude_binaries` 为打包内嵌（启动更慢、更易被杀软误报）。
 
