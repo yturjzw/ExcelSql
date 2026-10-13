@@ -130,6 +130,23 @@ def _get_store() -> "sqlite3.Connection":
             "CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)"
         )
         _STORE_DB.commit()
+        # 诊断：记录本次实际使用的库路径 + 现有 key（排查冻结 exe 读错库/读空库）。
+        # 写入 store_debug.log（与 app.sqlite 同目录），失败静默不影响功能。
+        try:
+            _keys = [r[0] for r in _STORE_DB.execute("SELECT k FROM kv").fetchall()]
+            _dump = _store_dir() / "store_debug.log"
+            with open(_dump, "a", encoding="utf-8") as _f:
+                _f.write(
+                    "[{t}] LOCALAPPDATA={lap!r} frozen={frozen} db_path={p!r} keys={keys}\n".format(
+                        t=time.strftime("%Y-%m-%d %H:%M:%S"),
+                        lap=os.environ.get("LOCALAPPDATA"),
+                        frozen=bool(getattr(sys, "frozen", False)),
+                        p=str(db_path),
+                        keys=_keys,
+                    )
+                )
+        except Exception:  # noqa: BLE001
+            pass
     return _STORE_DB
 
 
