@@ -535,10 +535,11 @@ def _tray_exit(icon, item):  # noqa: ARG001
 
 
 def _start_tray():
-    """启动托盘线程；返回 pystray.Icon（失败返回 None，应用退化为无托盘）。"""
+    """启动托盘（独立线程跑消息循环）；返回 pystray.Icon（失败返回 None，应用退化为无托盘）。"""
     try:
         import pystray
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _log(f"tray: import pystray failed: {e}")
         return None
     try:
         icon = pystray.Icon(
@@ -550,9 +551,17 @@ def _start_tray():
                 pystray.MenuItem("退出", _tray_exit),
             ),
         )
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _log(f"tray: create icon failed: {e}")
         return None
-    threading.Thread(target=icon.run, name="tray", daemon=True).start()
+    try:
+        # run_detached：在独立线程跑消息循环（主线程被 Qt 事件循环占用）。
+        # 不能用 run()——pystray 要求 run() 在主线程调用，否则图标不显示。
+        icon.run_detached()
+    except Exception as e:  # noqa: BLE001
+        _log(f"tray: run_detached failed: {e}")
+        return None
+    _log("tray started")
     return icon
 
 
@@ -903,7 +912,19 @@ def _is_url_alive(url: str, timeout: float = 1.0) -> bool:
 
 
 def _reopen_existing() -> int:
-    """单实例已被占用：把已有实例的查询台页面重新在系统浏览器中打开。"""
+    """单实例已被占用：优先显示已有原生窗口（可能被隐藏到托盘）；无原生窗口才回退浏览器。"""
+    hwnd = _tray_window_hwnd()
+    if hwnd:
+        try:
+            user32 = ctypes.windll.user32
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE：恢复最小化/显示
+            user32.ShowWindow(hwnd, 5)  # SW_SHOW：显示隐藏窗口
+            user32.SetForegroundWindow(hwnd)
+            _log("existing instance window restored")
+            return 0
+        except Exception as e:  # noqa: BLE001
+            _log(f"restore existing window failed: {e}")
+
     port = _read_last_port()
     url = f"http://127.0.0.1:{port}/" if port else None
     if url and _is_url_alive(url):
