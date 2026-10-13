@@ -18,6 +18,17 @@ import threading
 import time
 import traceback
 
+from apppaths import exe_dir as _apppaths_exe_dir
+from apppaths import local_appdata
+
+
+def _app_data_file(name: str) -> str:
+    """%LOCALAPPDATA%\\ExcelSqlConsole\\<name>；LOCALAPPDATA 缺失回退 exe 目录。"""
+    base = local_appdata()
+    if base:
+        return os.path.join(base, "ExcelSqlConsole", name)
+    return os.path.join(str(_apppaths_exe_dir()), name)
+
 # QtWebEngine（pywebview gui="qt"）在远程桌面/虚拟显示（如 Todesk、RDP、虚拟机）下
 # GPU 硬件加速会失效，表现为窗口白屏。经实测：仅 --disable-gpu 仍会白屏（QtWebEngine
 # 6.x 仍尝试创建 GL 上下文 virgl 失败），必须强制 ANGLE 走 SwiftShader 纯软件渲染。
@@ -144,17 +155,9 @@ def _patch_edgechromium_args() -> None:
     ec.EdgeChrome.__init__ = _patched_init
     _EDGE_PATCHED = True
 
-LOG_PATH = os.path.join(
-    os.path.expandvars(r"%LOCALAPPDATA%"),
-    "ExcelSqlConsole",
-    "app.log",
-)
+LOG_PATH = _app_data_file("app.log")
 
-DIAG_PATH = os.path.join(
-    os.path.expandvars(r"%LOCALAPPDATA%"),
-    "ExcelSqlConsole",
-    "diagnose.txt",
-)
+DIAG_PATH = _app_data_file("diagnose.txt")
 
 
 def _log(msg: str) -> None:
@@ -701,8 +704,8 @@ def _wait_fallback_idle(backend_app, server_thread) -> None:
 
 
 def _last_port_path() -> str:
-    """last_port.txt 路径：LOCALAPPDATA；不可用则回退 exe 所在目录。"""
-    local = os.environ.get("LOCALAPPDATA")
+    """last_port.txt 路径：LOCALAPPDATA（含 API 兜底）；不可用则回退 exe 所在目录。"""
+    local = local_appdata()
     if local:
         try:
             d = os.path.join(local, "ExcelSqlConsole")
@@ -742,8 +745,8 @@ def _read_last_port() -> int | None:
 
 
 def _fallback_flag_path() -> str:
-    """fallback_silent.flag 路径：LOCALAPPDATA；不可用则回退 exe 所在目录。"""
-    local = os.environ.get("LOCALAPPDATA")
+    """fallback_silent.flag 路径：LOCALAPPDATA（含 API 兜底）；不可用则回退 exe 目录。"""
+    local = local_appdata()
     if local:
         try:
             d = os.path.join(local, "ExcelSqlConsole")

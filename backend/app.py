@@ -23,11 +23,14 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import tkinter as tk
 import uuid
 import zipfile
 from pathlib import Path
 from tkinter import filedialog
+
+from apppaths import app_data_dir, exe_dir
 
 import duckdb
 from fastapi import FastAPI, HTTPException
@@ -107,16 +110,33 @@ _STORE_LOCK = threading.Lock()
 
 
 def _store_dir() -> Path:
-    """SQLite 库文件目录：优先 LOCALAPPDATA；不可用则回退 exe 所在目录（便于排查）。"""
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        p = Path(local) / "ExcelSqlConsole"
+    """SQLite 库文件目录：优先 LOCALAPPDATA（含 Windows API 兜底）；不可用回退 exe 目录。
+
+    注意：冻结 windowed 进程里 os.environ 可能缺 LOCALAPPDATA，故经 app_data_dir()
+    用 SHGetKnownFolderPath 兜底，避免误读写 exe 目录下的"空库"。
+    """
+    d = app_data_dir()
+    if d is not None:
+        return d
+    return exe_dir()
+
+
+def _store_debug(msg: str) -> None:
+    """把诊断行追加到 store_debug.log（exe 目录 + 数据目录双写；失败静默）。"""
+    targets = set()
+    try:
+        targets.add(exe_dir() / "store_debug.log")
+        d = app_data_dir()
+        if d is not None:
+            targets.add(d / "store_debug.log")
+    except Exception:  # noqa: BLE001
+        pass
+    for _t in targets:
         try:
-            p.mkdir(parents=True, exist_ok=True)
-            return p
-        except OSError:
-            pass
-    return Path(os.path.dirname(sys.executable)) if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
+            with open(_t, "a", encoding="utf-8") as _f:
+                _f.write(msg + "\n")
+        except Exception:  # noqa: BLE001
+            continue
 
 
 def _get_store() -> "sqlite3.Connection":
@@ -124,29 +144,36 @@ def _get_store() -> "sqlite3.Connection":
     global _STORE_DB
     if _STORE_DB is None:
         db_path = _store_dir() / "app.sqlite"
-        _STORE_DB = sqlite3.connect(str(db_path), check_same_thread=False)
-        _STORE_DB.execute("PRAGMA journal_mode = WAL")
-        _STORE_DB.execute(
-            "CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)"
-        )
-        _STORE_DB.commit()
-        # 诊断：记录本次实际使用的库路径 + 现有 key（排查冻结 exe 读错库/读空库）。
-        # 写入 store_debug.log（与 app.sqlite 同目录），失败静默不影响功能。
+        try:
+            _STORE_DB = sqlite3.connect(str(db_path), check_same_thread=False)
+            _STORE_DB.execute("PRAGMA journal_mode = WAL")
+            _STORE_DB.execute(
+                "CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)"
+            )
+            _STORE_DB.commit()
+        except Exception:  # noqa: BLE001
+            _STORE_DB = None
+            _store_debug(
+                "[{t}] _get_store FAILED frozen={frozen} db_path={p!r}\n{tb}".format(
+                    t=time.strftime("%Y-%m-%d %H:%M:%S"),
+                    frozen=bool(getattr(sys, "frozen", False)),
+                    p=str(db_path),
+                    tb=traceback.format_exc(),
+                )
+            )
+            raise
         try:
             _keys = [r[0] for r in _STORE_DB.execute("SELECT k FROM kv").fetchall()]
-            _dump = _store_dir() / "store_debug.log"
-            with open(_dump, "a", encoding="utf-8") as _f:
-                _f.write(
-                    "[{t}] LOCALAPPDATA={lap!r} frozen={frozen} db_path={p!r} keys={keys}\n".format(
-                        t=time.strftime("%Y-%m-%d %H:%M:%S"),
-                        lap=os.environ.get("LOCALAPPDATA"),
-                        frozen=bool(getattr(sys, "frozen", False)),
-                        p=str(db_path),
-                        keys=_keys,
-                    )
-                )
         except Exception:  # noqa: BLE001
-            pass
+            _keys = ["<error>"]
+        _store_debug(
+            "[{t}] store OPENED frozen={frozen} db_path={p!r} keys={keys}".format(
+                t=time.strftime("%Y-%m-%d %H:%M:%S"),
+                frozen=bool(getattr(sys, "frozen", False)),
+                p=str(db_path),
+                keys=_keys,
+            )
+        )
     return _STORE_DB
 
 
