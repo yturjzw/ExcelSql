@@ -35,4 +35,5 @@ frontend.bak/
 .DS_Store
 Thumbs.db
 debug.log
-ExcelSqlConsole_trust.cerstore_debug.log
+ExcelSqlConsole_trust.cer
+store_debug.log

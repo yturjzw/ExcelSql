@@ -542,6 +542,171 @@ def _tray_exit(icon, item):  # noqa: ARG001
     os._exit(0)
 
 
+def _env_diag() -> str:
+    """采集运行环境的会话/窗口站/桌面/完整性，用于判断托盘为何不显示。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.windll.kernel32
+        u32 = ctypes.windll.user32
+        adv32 = ctypes.windll.advapi32
+
+        parts = []
+
+        # 会话 ID
+        sid = wintypes.DWORD()
+        k32.ProcessIdToSessionId(k32.GetCurrentProcessId(), ctypes.byref(sid))
+        parts.append(f"session={sid.value}")
+
+        # 窗口站 / 桌面名称
+        try:
+            def _obj_name(gethandle, info):
+                h = gethandle()
+                if not h:
+                    return "?"
+                UOI_NAME = 2
+                n = ctypes.create_unicode_buffer(256)
+                u32.GetUserObjectInformationW(h, UOI_NAME, n, ctypes.sizeof(n), None)
+                return n.value or "?"
+
+            parts.append("winsta=" + _obj_name(u32.GetProcessWindowStation, None))
+            parts.append("desktop=" + _obj_name(u32.GetThreadDesktop, u32.GetCurrentThreadId()))
+        except Exception:  # noqa: BLE001
+            parts.append("winsta=? desktop=?")
+
+        # 完整性级别（受限令牌判断）
+        try:
+            TOKEN_QUERY = 0x0008
+            TokenIntegrityLevel = 25
+            h = ctypes.c_void_p()
+            if adv32.OpenProcessToken(k32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(h)):
+                class _SID(ctypes.Structure):
+                    _fields_ = [("Revision", ctypes.c_ubyte),
+                                ("SubAuthorityCount", ctypes.c_ubyte),
+                                ("IdentifierAuthority", ctypes.c_ubyte * 6),
+                                ("SubAuthority", ctypes.c_uint32)]
+                class _TI(ctypes.Structure):
+                    _fields_ = [("TokenIntegrityLevel", _SID),
+                                ("Padding", ctypes.c_uint32)]
+                ti = _TI()
+                sz = wintypes.DWORD()
+                adv32.GetTokenInformation(h, TokenIntegrityLevel, ctypes.byref(ti),
+                                          ctypes.sizeof(ti), ctypes.byref(sz))
+                sub = ti.TokenIntegrityLevel.SubAuthority
+                il = sub[
+                    ti.TokenIntegrityLevel.SubAuthorityCount - 1] if ti.TokenIntegrityLevel.SubAuthorityCount else 0
+                names = {0x1000: "Untrusted", 0x2000: "Low", 0x3000: "Medium",
+                         0x4000: "High", 0x5000: "System"}
+                parts.append(f"integrity={names.get(il, hex(il))}")
+                adv32.CloseHandle(h)
+            else:
+                parts.append("integrity=?")
+        except Exception:  # noqa: BLE001
+            parts.append("integrity=?")
+
+        return " ".join(parts)
+    except Exception as e:  # noqa: BLE001
+        return f"diag exc: {e}"
+
+
+def _tray_get_rect(icon) -> str:
+    """用 Shell_NotifyIconGetRect 查询托盘图标在通知区中的屏幕位置。
+
+    返回说明：
+      - 'ok (left,top)-(right,bottom)'：图标确实在任务栏通知区里（包括「^」隐藏区）。
+      - 'not_found'：系统通知区里没有这个图标（注册"成功"但实际没放进去）。
+      - 其它：调用异常/错误码。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        hwnd = getattr(icon, "_hwnd", None)
+        if not hwnd:
+            return "no-hwnd"
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", wintypes.BYTE * 8),
+            ]
+
+        class _NOTIFYICONIDENTIFIER(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("hWnd", wintypes.HWND),
+                ("uID", wintypes.UINT),
+                ("guidItem", _GUID),
+            ]
+
+        class _RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", wintypes.LONG),
+                ("top", wintypes.LONG),
+                ("right", wintypes.LONG),
+                ("bottom", wintypes.LONG),
+            ]
+
+        nid = _NOTIFYICONIDENTIFIER()
+        nid.cbSize = ctypes.sizeof(_NOTIFYICONIDENTIFIER)
+        nid.hWnd = hwnd
+        nid.uID = 0  # pystray 实际以 uID=0 注册（hID kwargs 被 ctypes 忽略）
+        nid.guidItem = _GUID()
+        rc = _RECT()
+
+        fn = ctypes.windll.shell32.Shell_NotifyIconGetRect
+        fn.argtypes = [
+            ctypes.POINTER(_NOTIFYICONIDENTIFIER),
+            ctypes.POINTER(_RECT),
+        ]
+        fn.restype = wintypes.BOOL
+        ok = fn(ctypes.byref(nid), ctypes.byref(rc))
+        if ok:
+            return "ok ({l},{t})-({r},{b})".format(
+                l=rc.left, t=rc.top, r=rc.right, b=rc.bottom
+            )
+        err = ctypes.get_last_error() or ctypes.windll.kernel32.GetLastError()
+        if err == 1168:
+            return "not_found (1168)"
+        return f"fail err={err}"
+    except Exception as e:  # noqa: BLE001
+        return f"exc: {e}"
+
+
+def _patch_pystray_win32() -> None:
+    """让 pystray 的 ChangeWindowMessageFilterEx 在拒绝访问时降级而非抛异常。
+
+    pystray 在 _create_window 中调用 ChangeWindowMessageFilterEx，以便「提权运行」
+    时也能收到 WM_TASKBARCREATED（Explorer 重启后重建图标）。但该增强项在本机受限
+    Token / 沙箱下返回 ERROR_ACCESS_DENIED(5)，而 pystray 的 ctypes errcheck 会把
+    任何 FALSE 返回统一抛成 PermissionError，导致托盘窗口创建失败、图标整体消失。
+    这里替换为安全包装：成功则透传；失败吞掉并返回 False（仅放弃该增强项，不影响
+    托盘图标显示与右键菜单）。
+    """
+    try:
+        from pystray._util import win32 as _win32
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(_win32, "_csvc_patched", False):
+        return
+    orig = _win32.ChangeWindowMessageFilterEx
+
+    def _safe(hwnd, message, action, change_filter_struct):
+        try:
+            return orig(hwnd, message, action, change_filter_struct)
+        except Exception:  # noqa: BLE001
+            return False
+
+    try:
+        _win32.ChangeWindowMessageFilterEx = _safe
+        _win32._csvc_patched = True
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _start_tray():
     """启动托盘（独立线程跑消息循环）；返回 pystray.Icon（失败返回 None，应用退化为无托盘）。"""
     try:
@@ -549,6 +714,7 @@ def _start_tray():
     except Exception as e:  # noqa: BLE001
         _log(f"tray: import pystray failed: {e}")
         return None
+    _patch_pystray_win32()
     try:
         icon = pystray.Icon(
             "ExcelSqlConsole",
@@ -587,6 +753,14 @@ def _start_tray():
                 )
             except Exception as e:  # noqa: BLE001
                 _log(f"tray report error: {e}")
+            try:
+                _log("tray rect: " + _tray_get_rect(icon))
+            except Exception as e:  # noqa: BLE001
+                _log(f"tray rect error: {e}")
+            try:
+                _log("tray env: " + _env_diag())
+            except Exception as e:  # noqa: BLE001
+                _log(f"tray env error: {e}")
 
         threading.Thread(target=_report, name="tray-report", daemon=True).start()
     except Exception as e:  # noqa: BLE001
