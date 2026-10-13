@@ -7,3 +7,5 @@
 fastapi>=0.110
 uvicorn>=0.29
 duckdb>=1.4.0
+pystray>=0.19         # 系统托盘（进入/退出程序）
+pillow>=10.0          # 托盘图标图片处理（pystray 依赖）

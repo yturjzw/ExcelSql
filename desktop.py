@@ -53,6 +53,11 @@ MUTEX_NAME = "Local\\ExcelSqlConsole_SingleInstance"
 WINDOW_TITLE = "EXCEL → SQL 查询台"
 WINDOW_SIZE = (1280, 820)
 
+# 系统托盘：跨线程控制窗口用。pywebview 的 Qt 后端把 show/hide/destroy 都做成
+# Qt Signal（跨线程 emit → GUI 线程排队执行），故托盘线程里直接调 window.show()/destroy() 是安全的。
+_WINDOW = None           # 当前原生窗口对象（tan 后由 main() 赋值）
+_EXIT_REQUESTED = False  # 托盘「退出」置位；窗口关闭事件据此区分「隐藏到托盘 / 真正退出」
+
 # 浏览器降级模式：无任何请求超过该时长自动退出（避免后台残留进程）
 _FALLBACK_IDLE_EXIT_S = 30 * 60
 
@@ -478,6 +483,100 @@ def _app_icon_path() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "app.ico")
 
 
+# ---------- 系统托盘（pystray） ----------
+# 窗口点关闭(X) → 隐藏到托盘（不退出）；托盘「打开窗口」恢复、「退出」才真正结束。
+# pystray 跑在独立线程；跨线程控制窗口走 pywebview 的 Qt Signal（线程安全）。
+
+
+def _tray_image():
+    """托盘图标：优先 assets/app.ico（缩到 32×32），失败就用纯色兜底。"""
+    from PIL import Image
+
+    path = _app_icon_path()
+    if os.path.exists(path):
+        try:
+            with Image.open(path) as im:
+                im.load()
+                if max(im.size) > 32:
+                    im = im.resize((32, 32), Image.LANCZOS)
+                return im.convert("RGBA")
+        except Exception:  # noqa: BLE001
+            pass
+    return Image.new("RGBA", (32, 32), (31, 41, 51, 255))
+
+
+def _tray_show(icon, item):  # noqa: ARG001
+    """托盘「打开窗口」：恢复/显示主窗口。"""
+    if _WINDOW is not None:
+        try:
+            _WINDOW.show()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _tray_exit(icon, item):  # noqa: ARG001
+    """托盘「退出」：真正关闭窗口并结束进程。"""
+    global _EXIT_REQUESTED
+    _EXIT_REQUESTED = True
+    if _WINDOW is not None:
+        try:
+            _WINDOW.destroy()
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    # 兜底：窗口对象不可用/销毁失败时，直接停后端并结束进程
+    try:
+        import backend.app as _ba
+
+        _ba.shutdown()
+    except Exception:  # noqa: BLE001
+        pass
+    os._exit(0)
+
+
+def _start_tray():
+    """启动托盘线程；返回 pystray.Icon（失败返回 None，应用退化为无托盘）。"""
+    try:
+        import pystray
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        icon = pystray.Icon(
+            "ExcelSqlConsole",
+            _tray_image(),
+            WINDOW_TITLE,
+            pystray.Menu(
+                pystray.MenuItem("打开窗口", _tray_show, default=True),
+                pystray.MenuItem("退出", _tray_exit),
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    threading.Thread(target=icon.run, name="tray", daemon=True).start()
+    return icon
+
+
+def _stop_tray(icon) -> None:
+    """停止托盘图标循环（应用退出时调用）。"""
+    if icon is None:
+        return
+    try:
+        icon.stop()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _on_closing():
+    """窗口关闭事件的拦截：默认隐藏到托盘；托盘「退出」置位后才真正放行关闭。"""
+    if _EXIT_REQUESTED:
+        return True  # pywebview: 非 False → 允许关闭（退出）
+    try:
+        _WINDOW.hide()
+    except Exception:  # noqa: BLE001
+        pass
+    return False  # pywebview: 返回 False → 取消关闭（隐藏到托盘）
+
+
 def _ensure_native_dll_paths() -> None:
     """把冻结包内的原生 DLL 目录加入进程的 DLL 搜索路径。
 
@@ -521,6 +620,7 @@ def main() -> int:
         return _rendertest()
 
     # 单实例：已有实例时本进程直接退出
+    global _WINDOW, _EXIT_REQUESTED
     mutex = _acquire_single_instance()
     if mutex is None:
         # 已有实例在运行：把它的查询台页面重新在系统浏览器中打开（避免“双击没反应”）
@@ -528,6 +628,7 @@ def main() -> int:
 
     backend = None
     server_thread = None
+    tray = None
     try:
         # 延迟导入：PyInstaller 冷启动更快，且此处才需要完整后端
         from backend import app as backend_app
@@ -576,7 +677,18 @@ def main() -> int:
             min_size=(960, 640),
             confirm_close=False,
         )
-        webview.start(gui="qt", icon=_app_icon_path())  # QtWebEngine 原生窗口；阻塞至窗口关闭
+        _EXIT_REQUESTED = False
+        _WINDOW = window
+        try:
+            # 关闭(X) → 隐藏到托盘；托盘「退出」置位后才真正关闭
+            window.events.closing += _on_closing
+        except Exception:  # noqa: BLE001
+            pass
+
+        tray = _start_tray()  # 启动托盘（不可用则 None，退化为无托盘）
+
+        # QtWebEngine 原生窗口；阻塞至窗口关闭（托盘「退出」→ destroy → 这里返回）
+        webview.start(gui="qt", icon=_app_icon_path())
     except Exception as e:  # noqa: BLE001
         # 窗口链路失败时不退出，降级为「系统浏览器打开内嵌服务」，保证产物仍可用。
         _log(f"desktop window unavailable -> browser fallback:\n{traceback.format_exc()}")
@@ -585,7 +697,9 @@ def main() -> int:
             # 用户选择「保持运行」：后台服务继续，直到空闲超时或服务线程退出。
             _wait_fallback_idle(backend_app, server_thread)
     finally:
-        # 4) 窗口关闭（或降级后）优雅停服务
+        # 4) 窗口关闭（或降级后）优雅停服务 + 停托盘
+        _stop_tray(tray)
+        _WINDOW = None
         backend_app.shutdown()
         if server_thread is not None:
             server_thread.join(timeout=3)

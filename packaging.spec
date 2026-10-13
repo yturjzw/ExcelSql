@@ -16,6 +16,9 @@ block_cipher = None
 # pywebview（qt 后端）
 webview_datas, webview_binaries, webview_hidden = collect_all("webview")
 
+# 系统托盘（pystray + Pillow）
+pystray_datas, pystray_binaries, pystray_hidden = collect_all("pystray")
+
 # QtWebEngine 原生窗口后端：PySide6 6.x 拆分为多个包，另有 qtpy shim。
 # 统一 collect_all，交给 PyInstaller 内置 hook（hook-PySide6 / hook-qtpy）收集
 # QtWebEngineProcess.exe、resources、translations 等运行时资源。
@@ -39,13 +42,13 @@ for _pkg in (
 a = Analysis(
     ["desktop.py"],
     pathex=["."],
-    binaries=webview_binaries + _qt_bins,
-    datas=webview_datas + _qt_datas + [
+    binaries=webview_binaries + _qt_bins + pystray_binaries,
+    datas=webview_datas + _qt_datas + pystray_datas + [
         ("frontend", "frontend"),          # 前端静态资源
         ("duckdb_ext", "duckdb_ext"),      # DuckDB excel 扩展（离线）
         ("assets", "assets"),              # 窗口/EXE 图标（app.ico）
     ],
-    hiddenimports=webview_hidden + _qt_hidden + [
+    hiddenimports=webview_hidden + _qt_hidden + pystray_hidden + [
         "webview.platforms.qt",
         "openpyxl",                 # 结果导出 Excel(.xlsx)
     ],
