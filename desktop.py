@@ -488,6 +488,14 @@ def _app_icon_path() -> str:
 # pystray 跑在独立线程；跨线程控制窗口走 pywebview 的 Qt Signal（线程安全）。
 
 
+def _tray_window_hwnd() -> int:
+    """按窗口标题查找主窗口 HWND（0 = 未找到）。供二次启动跨进程唤醒已有窗口用。"""
+    try:
+        return int(ctypes.windll.user32.FindWindowW(None, WINDOW_TITLE) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _tray_image():
     """托盘图标：优先 assets/app.ico（缩到 32×32），失败就用纯色兜底。"""
     from PIL import Image
@@ -555,11 +563,34 @@ def _start_tray():
         _log(f"tray: create icon failed: {e}")
         return None
     try:
-        # run_detached：在独立线程跑消息循环（主线程被 Qt 事件循环占用）。
-        # 不能用 run()——pystray 要求 run() 在主线程调用，否则图标不显示。
-        icon.run_detached()
+        # 后台线程跑 pystray 消息循环；主线程被 Qt 事件循环占用。
+        # 用自家线程 + 显式兜底捕获 run() 的异常，写出 app.log 便于定位。
+        def _run_guarded() -> None:
+            try:
+                icon.run()
+            except Exception:  # noqa: BLE001
+                _log(f"tray: run crashed:\n{traceback.format_exc()}")
+
+        threading.Thread(target=_run_guarded, name="tray", daemon=True).start()
+
+        # 3 秒后回读托盘状态（visible=True 表示图标已成功加入任务栏通知区）
+        def _report() -> None:
+            time.sleep(3)
+            try:
+                _log(
+                    "tray report: visible={v} hwnd={h} icon_valid={iv} running={r}".format(
+                        v=icon.visible,
+                        h=getattr(icon, "_hwnd", None),
+                        iv=getattr(icon, "_icon_valid", None),
+                        r=getattr(icon, "_running", None),
+                    )
+                )
+            except Exception as e:  # noqa: BLE001
+                _log(f"tray report error: {e}")
+
+        threading.Thread(target=_report, name="tray-report", daemon=True).start()
     except Exception as e:  # noqa: BLE001
-        _log(f"tray: run_detached failed: {e}")
+        _log(f"tray: start failed: {e}")
         return None
     _log("tray started")
     return icon
