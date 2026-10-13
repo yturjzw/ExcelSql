@@ -145,8 +145,10 @@ def _get_store() -> "sqlite3.Connection":
     if _STORE_DB is None:
         db_path = _store_dir() / "app.sqlite"
         try:
-            _STORE_DB = sqlite3.connect(str(db_path), check_same_thread=False)
-            _STORE_DB.execute("PRAGMA journal_mode = WAL")
+            # 默认 DELETE 日志模式（不设 WAL）：WAL 需在库目录创建 -wal/-shm 文件，
+            # 在只读目录（沙箱/受限制环境）会报 "unable to open database file"，导致
+            # 连读历史都失败。单进程桌面应用无并发读需求，DELETE 模式更稳妥。
+            _STORE_DB = sqlite3.connect(str(db_path), check_same_thread=False, timeout=5)
             _STORE_DB.execute(
                 "CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)"
             )
